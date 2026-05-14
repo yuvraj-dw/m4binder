@@ -37,3 +37,22 @@ def test_cleanup_skips_already_quiet(fixture_m4b, tmp_path):
 
     # File should be untouched (no replace)
     assert work.stat().st_mtime == mtime_before
+
+
+import pytest
+
+
+def _df3_available():
+    try:
+        from m4b_lib import cleanup_ml  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
+@pytest.mark.skipif(not _df3_available(), reason="DeepFilterNet not installed")
+def test_cleanup_ml_runs(fixture_m4b, tmp_path):
+    work = tmp_path / "work_ml.m4b"
+    shutil.copy(fixture_m4b, work)
+    clean_one(str(work), mode="ml", keep_original=False, skip_threshold_db=1.0)
+    assert ffmpeg_utils.get_duration(str(work)) > 3.0
