@@ -1,7 +1,5 @@
 """Pytest fixtures: synthesize tiny audio files via ffmpeg lavfi at session start."""
-import os
 import subprocess
-import shutil
 import pytest
 
 
