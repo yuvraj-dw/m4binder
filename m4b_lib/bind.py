@@ -49,6 +49,7 @@ def _bind_one(input_folder: str, output_m4b: str, opts: BindOptions) -> None:
             output_m4b=output_m4b,
             title=meta.title,
             author=meta.author,
+            bitrate=opts.bitrate,
         )
     print(f"Created audiobook: {output_m4b}")
 
@@ -76,4 +77,5 @@ def bind_multiple(opts: BindOptions) -> None:
             _bind_one(sub, out, opts)
         except Exception as e:
             print(f"[ERROR] Failed on {sub}: {e}")
-        print(f"[INFO] Finished subfolder -> {out}")
+        else:
+            print(f"[INFO] Finished subfolder -> {out}")

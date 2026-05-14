@@ -56,8 +56,9 @@ def concat_audio_to_m4b(audio_files: list[str], output_m4b: str) -> None:
     listfile = output_m4b + ".concat.txt"
     with open(listfile, "w") as f:
         for p in audio_files:
-            # Use double-quoted path escaping per ffmpeg concat spec
-            f.write(f"file '{p}'\n")
+            # Escape apostrophes per ffmpeg concat demuxer spec
+            safe_p = p.replace("'", r"'\''")
+            f.write(f"file '{safe_p}'\n")
     try:
         subprocess.run(
             [
@@ -87,7 +88,7 @@ def extract_chapters(m4b_path: str, out_ini_path: str) -> None:
 
 def embed_chapters_and_meta(
     audio_in: str, chapters_ini: Optional[str], cover_bytes: Optional[bytes],
-    output_m4b: str, title: str = "", author: str = "",
+    output_m4b: str, title: str = "", author: str = "", bitrate: str = "64k",
 ) -> None:
     """Re-encode audio_in to m4b, attaching chapters from ffmetadata file + optional cover."""
     cmd = ["ffmpeg", "-y", "-i", audio_in]
@@ -105,7 +106,7 @@ def embed_chapters_and_meta(
         cmd += ["-metadata", f"title={title}"]
     if author:
         cmd += ["-metadata", f"artist={author}"]
-    cmd += ["-c:a", "aac", "-b:a", "64k", output_m4b]
+    cmd += ["-c:a", "aac", "-b:a", bitrate, output_m4b]
     try:
         subprocess.run(cmd, check=True, capture_output=True)
     finally:

@@ -6,9 +6,9 @@ Two modes:
 
 Common flow:
   1. Decode m4b -> wav
-  2. Extract chapters + cover art from m4b
+  2. Extract chapters from m4b
   3. Process wav with chosen pipeline
-  4. Re-encode wav -> m4b with chapters + cover re-attached
+  4. Re-encode wav -> m4b with chapters preserved (cover art not extracted)
 """
 import glob
 import os
