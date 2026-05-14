@@ -3,7 +3,6 @@
 Loads DF3 model once (module-level) and exposes a function that processes a wav file.
 GPU is auto-detected by the library; falls back to CPU.
 """
-import os
 import torch
 import torchaudio
 from df.enhance import enhance, init_df
