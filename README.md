@@ -1,184 +1,92 @@
-# MP3-to-M4B Converter
+# m4binder + audio cleanup
 
-A Python CLI script that converts folder(s) of MP3 chapters into an M4B audiobook, optionally embedding chapter metadata and cover art. It can also fetch metadata from Open Library (e.g., title, author, cover). This script supports two modes:
+Two subcommands sharing one codebase, hardened with 25 tests (TDD for H1/H3/H4).
 
-1. **Single** – Convert all MP3 files in **one folder** into a single M4B.  
-2. **Multiple** – For each **subfolder** in the input folder, convert MP3 files within that subfolder into its own M4B.
-
----
-
-## Table of Contents
-- [MP3-to-M4B Converter](#mp3-to-m4b-converter)
-  - [Table of Contents](#table-of-contents)
-  - [Prerequisites](#prerequisites)
-  - [Installation](#installation)
-  - [Usage](#usage)
-    - [Single Mode Example](#single-mode-example)
-    - [Multiple Mode Example](#multiple-mode-example)
-  - [Metadata Source](#metadata-source)
-  - [Examples](#examples)
-  - [Troubleshooting](#troubleshooting)
-  - [License](#license)
-
----
-
-## Prerequisites
-
-1. **FFmpeg**  
-   You must have [FFmpeg](https://www.ffmpeg.org/download.html) installed and in your system’s PATH. This script relies on FFmpeg for audio processing (encoding, merging, adding metadata).
-
-2. **Python 3.7+**  
-   - If you don’t already have Python, install it from [python.org/download/releases/](https://www.python.org/download/releases/).  
-
-3. **Pip & Requirements**  
-   The script has some Python dependencies, so you’ll want to install them from `requirements.txt`.
-
----
-
-## Installation
-
-1. **Install FFmpeg**  
-   Follow the [official FFmpeg download guide](https://www.ffmpeg.org/download.html) for your operating system (Windows, macOS, Linux).  
-   - Once installed, confirm `ffmpeg` is accessible by running:
-     ```bash
-     ffmpeg -version
-     ```
-   - If FFmpeg is not found, ensure your environment variables are set so that the `ffmpeg` command is recognized.
-
-2. **Install Python 3.7+**  
-   - If you need Python, go to [python.org/download/releases/](https://www.python.org/download/releases/) and download/install the latest version.
-
-3. **Clone or Download This Repository**  
-   - If you have Git:
-     ```bash
-     git clone https://github.com/your_username/mp3-to-m4b-converter.git
-     ```
-   - Or simply download the ZIP and extract.
-
-4. **Install Python Dependencies**  
-   In the project directory, run:
-   ```bash
-   pip install -r requirements.txt
-   ```
-
----
-
-## Usage
-
-Run the script directly from your terminal using Python:
+## bind — mp3 chapters → m4b
 
 ```bash
-python m4binder.py [OPTIONS]
+# Single book (requires --overwrite to replace existing)
+python m4binder.py bind --mode single \
+  --input-folder /path/to/book_mp3s \
+  --output-file /path/to/output.m4b
+
+# Many books (each subfolder is a book) — skips existing .m4b unless --overwrite
+python m4binder.py bind --mode multiple \
+  --input-folder /path/to/library \
+  --output-folder /path/to/m4bs/ \
+  --overwrite
+
+# Legacy flat args still work via compat shim (deprecated):
+python m4binder.py --mode multiple --input-folder ... --output-folder ...
 ```
 
-Key arguments:
+- Natural sort (`1,2,10` not `1,10,2`), apostrophe-safe concat, atomic final write via tmp+replace, faststart, chapter generation from mp3 durations + ID3 titles, cover preserved as bytes, bitrate validated `^\d+[kM]?$`, output-folder defaults to input-folder.
+- Metadata: `--metadata-source openlibrary|none` (google removed). Title fallback prefers album tag (old behavior).
 
-| Argument               | Description                                                                                                                                                                     |
-|------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `--mode`               | **single** (default) or **multiple**. In single mode, converts all MP3s in one folder into **one** M4B. In multiple mode, each subfolder is treated as a separate book.             |
-| `--input-folder`       | The folder containing MP3 files (in **single** mode) or subfolders containing MP3 files (in **multiple** mode).                                                                  |
-| `--output-file`        | **(Single mode)** The M4B filename to create. Required in single mode.                                                                                                         |
-| `--output-folder`      | **(Multiple mode)** Where to place all final M4B files. If not specified, defaults to placing them in the same `--input-folder`.                                                 |
-| `--metadata-source`    | Source to fetch book metadata: **`openlibrary`** or **`none`**.                                                                                                                |
-| `--title` / `--author` | Used for metadata lookup if you choose `--metadata-source openlibrary`. If not provided, the script attempts to read ID3 tags from the first MP3 file.                          |
-
-### Single Mode Example
-You have a folder containing MP3 files for “My Book.” Run:
+## clean — restore an existing m4b
 
 ```bash
-python m4binder.py \
-  --mode single \
-  --input-folder /path/to/mybook_mp3s \
-  --output-file /path/to/output/mybook.m4b \
-  --metadata-source openlibrary \
-  --title "My Book Title" \
-  --author "John Doe"
+# One book, basic DSP (sox + ffmpeg, CPU only, safe default)
+python m4binder.py clean --input '/path/to/Some Book.m4b'
+
+# One book, ML mode (DeepFilterNet 3, GPU if available, experimental)
+python m4binder.py clean --input '/path/to/Some Book.m4b' --mode ml
+
+# Batch a directory (supports ** recursive)
+python m4binder.py clean --input /mnt/md0/share/audiobooks/ --pattern '195*.m4b' --mode ml
+
+# Keep original as .orig.m4b versioned .orig.1.m4b if exists
+python m4binder.py clean --input '/path/to/Some Book.m4b' --mode ml --keep-original
+
+# Overwrite guards: bind skips existing .m4b, clean atomic replace with size validation
 ```
 
-- **`--mode single`** indicates we’re converting one folder of MP3s into one M4B.  
-- **`--title`** and **`--author`** (optional) help fetch metadata, including cover art, from Open Library.
+`clean` decodes m4b to wav, runs pipeline, loudnorm two-pass -19 LUFS, re-encodes to m4b with chapters+cover preserved, faststart, atomic replace in same FS, backup versioning.
 
-### Multiple Mode Example
-You have a folder containing multiple subfolders, each with its own set of MP3 files. For example:
+Files quieter than `--skip-threshold-db` (default -35dB mean_volume) are skipped. Probe now scans whole file via volumedetect (was 5s).
 
-```
-/path/to/audiobooks/
-   ├── Book1/
-   │    ├── 01.mp3
-   │    ├── 02.mp3
-   │    └── ...
-   ├── Book2/
-   │    ├── 01.mp3
-   │    ├── 02.mp3
-   │    └── ...
-   └── Book3/
-        ├── 01.mp3
-        ├── 02.mp3
-        └── ...
-```
+### Pipelines (pro-tuned)
 
-To convert **each** of these subfolders into a separate `.m4b`, run:
+- **basic** (safe, CPU, 1MB dep): ffmpeg silencedetect -40dB d=1.0 → sox noiseprof/noisered aggression 0.27 (was 0.21) with trim EOF guard and sox existence check → highpass 70Hz (was 80) lowpass 16000Hz (was 14k) → compand gate-downward `0.05,0.2 -60,-90,-40,-40,-20,-10,0,-5 0 -90 0.1` (was boosting noise) → ffmpeg loudnorm two-pass I=-19 TP=-2 LRA=7 dual_mono=true (was single-pass -18/-1.5/11). Mono 64k standard (was stereo 64k = 32k/ch poor).
+- **ml** (experimental, needs torch 2GB): DeepFilterNet3 inference, streaming via soundfile 60s chunks + 2s equal-power sin/cos crossfade (was linear -3dB dip), device-aware fade tensors, locked model singleton, log_file=None, resampler cache locked, explicit PCM_S 16, unload_model + gc, atomic embed. Decodes mono 48k native (half RAM), loudnorm two-pass same as basic, mono 64k output. Falls back to full-load chunked if SR mismatch (still OOM risk for 10h if fallback). GPU auto-detect, 2-3GB VRAM per chunk.
+
+Both preserve cover (extract via `ffmpeg -an -vcodec copy`, cap 20MB) and chapters, faststart, size>1024 validation.
+
+### Security / Reliability hardening (H1-H4)
+
+- H1 atomic: embed writes to `mkstemp(dir=final_dir)` + `os.replace`, not direct -y truncation. Validates size, cleans temp on failure. Bind and clean both use same pattern.
+- H2 dedup TOCTOU: parallel_transcode reserves output via `O_EXCL|O_NOFOLLOW` empty file before ffmpeg, versioning _1 suffix avoids collision with existing_on_disk snapshot, cancels pending futures.
+- H3 no-overwrite: parallel_transcode raises FileExistsError or versions, bind_multiple skips existing unless --overwrite, transcode uses -y only on temp it owns.
+- H4 get_duration returns None not 0.0 for missing/corrupt, callers skip zero-duration <100ms with warning, placeholder 1s chapter if all skipped.
+- M6 concat listfile symlink: uses mkstemp dir=final_dir not output.m4b.concat.txt open(w) following symlink.
+- Cover bomb: TODO cap 20MB (partial), requests timeout 15s.
+
+### ML — Is DF3 right for audiobooks? Naysayer view
+
+DF3 = real-time comms tool, ERB 32 bands + deep filtering 96 bins 0-4.8kHz only, >4.8kHz only masking → sibilance loss, breath over-suppression (prosody), musical chirps on sustained vowels. Destroys non-speech (music beds, chapter stings) and downmixes stereo→mono irreversibly. Chunked state reset every 58s → pumping, crossfade dip. Training DNS 3-10s English VoIP, not tape hiss stationary (sox better). Cost 800MB DL 1.6GB disk torch, internet first run.
+
+Keep dual mode, default basic safe, ml experimental with banner. Prefer Rust `deep-filter` binary (15-30MB, tract SIMD, no torch, built-in streaming) if available.
+
+## Install
 
 ```bash
-python m4binder.py \
-  --mode multiple \
-  --input-folder /path/to/audiobooks \
-  --output-folder /path/to/converted_audiobooks \
-  --metadata-source openlibrary
+pip install -r requirements.txt          # basic + bind (mutagen, requests, openlibrary-client pinned)
+pip install -r requirements-ml.txt       # adds ML: deepfilternet==0.5.6, soundfile==0.13.1, torch==2.6.0 torchaudio==2.6.0 (2GB, needs CUDA or CPU index)
+# System deps: ffmpeg >=7, ffprobe, sox 14.4.2 (basic), Rust deep-filter binary optional for ML
 ```
 
-- Each subfolder (Book1, Book2, Book3) will be processed into its own `.m4b` in `/path/to/converted_audiobooks`.
+First ML run downloads DeepFilterNet3 model ~10MB to ~/.cache/deepfilternet, needs internet.
 
----
+## Tests — 25 passing (TDD)
 
-## Metadata Source
+```bash
+pytest tests/ -v
+# 10 original smoke + 8 new coverage + 7 TDD H1/H3/H4
+```
 
-- **`openlibrary`**: Attempts to fetch official metadata (title, authors, cover art, etc.) from Open Library.  
-- **`none`**: Skips online metadata. The script will attempt to read embedded ID3 tags (like cover art) from the first MP3 file in each set. If no tags are found, it’ll default to generic placeholders.
+- TDD: test_tdd_failures.py proves atomicity, no-overwrite, get_duration None (red→green)
+- Coverage: iter_targets batch/recursive/broken symlink, keep-original versioning .orig.1, cover+chapter preservation, sox silence window, apostrophe escaping, backslash escaping, zero-duration, parallel order + no-delete-preexisting
+- Warnings: 72x DeprecationWarning multiprocessing fork after torch threads — will become deadlock in 3.14, should switch to ThreadPoolExecutor or spawn
 
-> **Note**: If you omit `--title` and/or `--author`, the script will try to read those values from the **first MP3** file’s ID3 tags.
+See PLAN.md for full roadmap and remaining P2.
 
----
-
-## Examples
-
-1. **Quick Single-Folder Conversion Without Metadata**  
-   ```bash
-   python m4binder.py \
-     --mode single \
-     --metadata-source none \
-     --input-folder /path/to/book_mp3s \
-     --output-file /path/to/output/book.m4b
-   ```
-
-2. **Multiple-Folder Conversion with OpenLibrary**  
-   ```bash
-   python m4binder.py \
-     --mode multiple \
-     --input-folder /path/to/audiobooks \
-     --output-folder /path/to/final_m4bs \
-     --metadata-source openlibrary
-   ```
-   If `--title` and `--author` are the same for all subfolders, the script will attempt to find metadata for each subfolder. If subfolders differ significantly, you may rely on each MP3’s ID3 tags or let Open Library do partial matching.
-
----
-
-## Troubleshooting
-
-1. **FFmpeg Not Found**  
-   - Ensure `ffmpeg` is installed and on your system’s PATH. You can verify by running `ffmpeg -version`.
-
-2. **No MP3 Files Detected**  
-   - Double-check your input folder paths. Make sure files actually have the `.mp3` extension.
-
-3. **Metadata Not Found / Covers Missing**  
-   - Open Library may not have an entry for your exact title/author. Ensure you’ve spelled them correctly, or use `--metadata-source none` to rely on embedded cover art.
-
-4. **High CPU Usage**  
-   - By default, the script parallelizes conversion of MP3 files (for faster performance).
-
----
-
-## License
-
-This project is provided under the [MIT License](./LICENSE) (or whichever license you apply). Feel free to modify and distribute it according to your needs.

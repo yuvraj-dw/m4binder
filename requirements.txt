@@ -1,2 +1,3 @@
-git+https://github.com/internetarchive/openlibrary-client.git
-mutagen
+openlibrary-client @ git+https://github.com/internetarchive/openlibrary-client.git@3f131881358d2c0dba5de79d894b80fae24742c6
+mutagen==1.47.0
+requests==2.32.3

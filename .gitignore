@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+
+# Distribution
+*.egg-info/
+dist/
+build/
+
+# Tests
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Audio outputs - prevent accidental commit
+*.m4b
+*.orig.m4b
+*.orig.*.m4b
+*.wav
+*.mp3
+*.cover.jpg
+*.concat.txt
+*.ffmetadata
+
+# OS
+.DS_Store
+Thumbs.db
