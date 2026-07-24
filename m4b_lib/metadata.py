@@ -38,12 +38,15 @@ def extract_id3_tags(mp3_path: str) -> dict:
         return {"title": "", "artist": "", "album": ""}
 
 
-def extract_embedded_cover(mp3_path: str) -> Optional[bytes]:
-    """Return APIC cover image bytes from an MP3, or None if absent."""
+def extract_embedded_cover(mp3_path: str, max_size: int = 20 * 1024 * 1024) -> Optional[bytes]:
+    """Return APIC cover image bytes from an MP3, or None if absent, capped at max_size."""
     try:
         audio = ID3(mp3_path)
         for tag in audio.values():
             if isinstance(tag, APIC):
+                if len(tag.data) > max_size:
+                    print(f"  [warn] embedded cover too large {len(tag.data)} > {max_size}, skipping")
+                    return None
                 return tag.data
     except Exception:
         pass
@@ -63,11 +66,28 @@ def lookup_openlibrary(title: str, author: str) -> BookMetadata:
         cover = None
         cover_id = getattr(work, "cover_id", None)
         if cover_id:
-            r = requests.get(
-                f"https://covers.openlibrary.org/b/id/{cover_id}-L.jpg", timeout=15
-            )
-            if r.ok:
-                cover = r.content
+            try:
+                r = requests.get(
+                    f"https://covers.openlibrary.org/b/id/{cover_id}-L.jpg",
+                    timeout=15, stream=True,
+                )
+                # Guard Content-Length and size cap 20MB
+                cl = r.headers.get("Content-Length")
+                if cl and int(cl) > 20 * 1024 * 1024:
+                    print(f"  [warn] OpenLibrary cover too large Content-Length {cl}, skipping")
+                elif r.ok:
+                    # Read with cap
+                    content = b""
+                    for chunk in r.iter_content(chunk_size=8192):
+                        content += chunk
+                        if len(content) > 20 * 1024 * 1024:
+                            print("  [warn] OpenLibrary cover exceeds 20MB cap, skipping")
+                            content = None
+                            break
+                    cover = content
+            except Exception as e:
+                print(f"  [warn] OpenLibrary cover fetch failed: {e}")
+                cover = None
         return BookMetadata(
             title=getattr(work, "title", title) or title,
             author=author,
@@ -82,11 +102,19 @@ def resolve_metadata(source: str, title: str, author: str, first_mp3: Optional[s
 
     source: 'openlibrary' | 'google' | 'none'.
     If title/author missing, fall back to ID3 tags of first_mp3.
+    Old code used album as book title fallback (album=book, title=chapter).
     """
+    if source == "google":
+        raise NotImplementedError("google metadata source is no longer supported; use openlibrary or none")
+
     if first_mp3 and (not title or not author):
         tags = extract_id3_tags(first_mp3)
-        title = title or tags["title"]
-        author = author or tags["artist"]
+        # Prefer album as book title (old behavior), fall back to title tag
+        if not title:
+            title = tags.get("album") or tags.get("title") or ""
+        if not author:
+            author = tags.get("artist") or ""
+
     if source == "openlibrary":
         meta = lookup_openlibrary(title, author)
     else:

@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "m4binder"
+version = "2.0.0"
+description = "MP3 to M4B binder + audiobook cleanup (sox + DeepFilterNet3)"
+readme = "README.md"
+requires-python = ">=3.11,<3.13"
+dependencies = [
+    "mutagen==1.47.0",
+    "requests==2.32.3",
+    "openlibrary-client @ git+https://github.com/internetarchive/openlibrary-client.git@3f131881358d2c0dba5de79d894b80fae24742c6",
+]
+
+[project.optional-dependencies]
+ml = [
+    "deepfilternet==0.5.6",
+    "soundfile==0.13.1",
+    "torch==2.6.0",
+    "torchaudio==2.6.0",
+]
+dev = [
+    "pytest==9.0.3",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v"
+markers = [
+    "ml: marks tests as requiring ML deps (torch, deepfilternet)",
+]

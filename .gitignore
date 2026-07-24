@@ -17,6 +17,16 @@ build/
 .coverage
 htmlcov/
 
+# Audio outputs - prevent accidental commit
+*.m4b
+*.orig.m4b
+*.orig.*.m4b
+*.wav
+*.mp3
+*.cover.jpg
+*.concat.txt
+*.ffmetadata
+
 # OS
 .DS_Store
 Thumbs.db
