@@ -31,8 +31,8 @@ def _add_clean_parser(sub):
     p = sub.add_parser("clean", help="Clean/restore an existing m4b file")
     p.add_argument("--input", required=True, help="Path to a .m4b file or a directory of them")
     p.add_argument("--pattern", default="*.m4b", help="Glob when --input is a directory")
-    p.add_argument("--mode", choices=["basic", "ml", "ml-rust"], default="basic",
-                   help="basic: sox (safe, CPU, 1MB), ml: DeepFilterNet3 torch (aggressive, 2GB), ml-rust: DeepFilterNet3 Rust binary (15MB, no torch, low RAM, preferred for batch)")
+    p.add_argument("--mode", choices=["basic", "basic-v2", "basic-afftdn", "hybrid", "ml", "ml-rust"], default="basic",
+                   help="basic: sox single-window 0.27 (safe), basic-v2: adaptive multi-window 0.32 + afftdn fallback (improved), basic-afftdn: pure afftdn adaptive (no silence needed), hybrid: de-hum+HP+afftdn+gate, ml: DeepFilterNet3 torch (aggressive) with Rust fallback, ml-rust: Rust binary only (15MB, preferred)")
     p.add_argument("--keep-original", action="store_true",
                    help="Save original as <name>.orig.m4b instead of replacing in place")
     p.add_argument("--skip-threshold-db", type=float, default=-35.0,
@@ -41,6 +41,9 @@ def _add_clean_parser(sub):
     p.add_argument("--chunk-s", type=float, default=60.0, help="ML chunk size seconds (default 60s)")
     p.add_argument("--overlap-s", type=float, default=2.0, help="ML overlap seconds (default 2s, equal-power crossfade)")
     p.add_argument("--device", default=None, help="ML device override: cpu, cuda, or auto (default auto-detect)")
+    p.add_argument("--atten-lim", type=float, default=100.0, help="ML-Rust attenuation limit dB (0=no reduction, 100=full, 20-30 keeps natural room tone for audiobooks)")
+    p.add_argument("--pf", action="store_true", help="ML-Rust enable post-filter (over-attenuates very noisy sections)")
+    p.add_argument("--pf-beta", type=float, default=0.02, help="ML-Rust post-filter beta (default 0.02, higher=stronger)")
     p.add_argument("--dry-run", action="store_true", help="List files that would be cleaned without cleaning")
     p.add_argument("--jobs", type=int, default=1, help="Parallel jobs for batch clean (default 1, use with caution GPU)")
     return p
@@ -86,13 +89,13 @@ def _dispatch_clean(args):
 
     if args.jobs and args.jobs > 1:
         from concurrent.futures import ThreadPoolExecutor, as_completed
-        # ThreadPool to avoid fork after torch threads (DeprecationWarning)
         print(f"[INFO] Cleaning {len(targets)} files with {args.jobs} jobs (ThreadPool)")
         def _clean_one(p):
             try:
                 clean_one(p, mode=args.mode, keep_original=args.keep_original,
                           skip_threshold_db=args.skip_threshold_db,
-                          chunk_s=args.chunk_s, overlap_s=args.overlap_s, device=args.device)
+                          chunk_s=args.chunk_s, overlap_s=args.overlap_s, device=args.device,
+                          atten_lim_db=args.atten_lim, pf=args.pf, pf_beta=args.pf_beta)
                 return (p, None)
             except Exception as e:
                 return (p, e)
@@ -112,10 +115,10 @@ def _dispatch_clean(args):
             try:
                 clean_one(path, mode=args.mode, keep_original=args.keep_original,
                           skip_threshold_db=args.skip_threshold_db,
-                          chunk_s=args.chunk_s, overlap_s=args.overlap_s, device=args.device)
+                          chunk_s=args.chunk_s, overlap_s=args.overlap_s, device=args.device,
+                          atten_lim_db=args.atten_lim, pf=args.pf, pf_beta=args.pf_beta)
             except Exception as e:
                 print(f"[ERROR] Failed on {path}: {e}")
-                # Continue with next file instead of aborting whole batch (R1 fix)
                 continue
 
 

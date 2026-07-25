@@ -25,31 +25,40 @@ def _find_binary() -> Optional[str]:
     return None
 
 
-def rust_enhance(wav_in: str, wav_out: str, model: str = "DeepFilterNet3") -> None:
-    """Enhance wav using Rust deep-filter binary."""
+def rust_enhance(wav_in: str, wav_out: str, model: str = "DeepFilterNet3",
+                 atten_lim_db: float = 100.0, pf: bool = False, pf_beta: float = 0.02,
+                 compensate_delay: bool = False) -> None:
+    """Enhance wav using Rust deep-filter binary.
+
+    Knobs:
+      atten_lim_db: 0-100 dB, 0=no reduction, 100=full. For audiobooks 20-30dB keeps natural room tone.
+      pf: enable post-filter (over-attenuates very noisy)
+      pf_beta: 0.02 default, higher = stronger post-filter
+      compensate_delay: add padding to compensate STFT lookahead delay
+    """
     binary = _find_binary()
     if binary is None:
         raise FileNotFoundError("deep-filter binary not found in PATH — install via cargo install deep_filter --features cli or download release")
 
-    # deep-filter expects wav files, output dir
-    # Usage: deep-filter [OPTIONS] [FILES]...
-    # We'll use temp out dir then move
     out_dir = os.path.dirname(os.path.abspath(wav_out))
     os.makedirs(out_dir, exist_ok=True)
 
-    # Create temp file for output to ensure atomicity similar to embed
     fd, tmp_out = tempfile.mkstemp(suffix=".wav", dir=out_dir)
     os.close(fd)
 
-    # deep-filter writes to out dir with same basename, so we need to place input in temp? Simpler: use input directly and let it output to tmp dir, then move
-    # Actually deep-filter: deep-filter --output-dir <dir> <input> -> creates <dir>/<basename>.wav
-    # We'll use a dedicated temp out dir
     with tempfile.TemporaryDirectory(prefix="deepfilter_") as tmp_out_dir:
-        # Default model is DeepFilterNet3, don't pass --model unless custom tar.gz path
+        cmd = [binary, "--output-dir", tmp_out_dir, "--atten-lim-db", str(atten_lim_db)]
+        if pf:
+            cmd.append("--pf")
+            if pf_beta != 0.02:
+                cmd.extend(["--pf-beta", str(pf_beta)])
+        if compensate_delay:
+            cmd.append("--compensate-delay")
         if model and model != "DeepFilterNet3" and os.path.isfile(model):
-            cmd = [binary, "--model", model, "--output-dir", tmp_out_dir, wav_in]
-        else:
-            cmd = [binary, "--output-dir", tmp_out_dir, wav_in]
+            cmd.extend(["--model", model])
+        # Input file last
+        cmd.append(wav_in)
+
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
         if result.returncode != 0:
             raise RuntimeError(f"deep-filter failed: {result.stderr[:1000]}")

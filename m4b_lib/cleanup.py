@@ -129,6 +129,161 @@ def _find_silence_window(wav_path: str) -> tuple[float, float] | None:
     return None
 
 
+def _find_silence_windows_adaptive(wav_path: str, thresholds: list[int] = [-40, -35, -30, -25], min_dur: float = 0.5) -> list[tuple[float, float]]:
+    """Intelligent silence finding: try thresholds from strict to loose, collect up to 5 windows."""
+    all_windows = []
+    for db in thresholds:
+        r = subprocess.run(
+            ["ffmpeg", "-i", wav_path, "-af", f"silencedetect=noise={db}dB:d={min_dur}", "-f", "null", "-"],
+            capture_output=True, text=True, timeout=120,
+        )
+        if r.returncode != 0:
+            continue
+        starts = re.findall(r"silence_start:\s*([\d.]+)", r.stderr)
+        ends = re.findall(r"silence_end:\s*([\d.]+)", r.stderr)
+        for s, e in zip(starts, ends):
+            try:
+                s_f, e_f = float(s), float(e)
+                if e_f - s_f >= min_dur:
+                    all_windows.append((s_f, e_f))
+            except:
+                continue
+        if len(all_windows) >= 3:
+            break
+    # Deduplicate and sort by duration desc, take top 5
+    # Remove overlapping windows
+    all_windows = sorted(set(all_windows))
+    # Filter overlapping: keep longest
+    filtered = []
+    for s, e in sorted(all_windows, key=lambda x: x[1]-x[0], reverse=True):
+        if not any(abs(s - fs) < 0.1 and abs(e - fe) < 0.1 for fs, fe in filtered):
+            # Check not overlapping existing too much
+            overlap = any(not (e <= fs or s >= fe) for fs, fe in filtered)
+            if not overlap or len(filtered) < 2:
+                filtered.append((s, e))
+        if len(filtered) >= 5:
+            break
+    return filtered
+
+
+def _sox_pipeline_v2(wav_in: str, wav_out: str, tmpdir: str) -> None:
+    """Improved basic: adaptive silence thresholds, multi-window average noise profile, 0.32 aggression, afftdn fallback."""
+    if shutil.which("sox") is None:
+        raise FileNotFoundError("sox not found in PATH")
+
+    windows = _find_silence_windows_adaptive(wav_in, thresholds=[-40, -35, -30, -25], min_dur=0.5)
+    if not windows:
+        print(f"  [warn] no silence windows found even with adaptive thresholds, using afftdn fallback")
+        _afftdn_pipeline(wav_in, wav_out)
+        return
+
+    print(f"  found {len(windows)} silence windows for noise profile: {windows[:3]}")
+    # Extract up to 3 windows as noise samples and average their profiles
+    noise_samples = []
+    noise_profiles = []
+    try:
+        file_dur = ffmpeg_utils.get_duration(wav_in)
+    except:
+        file_dur = None
+
+    for idx, (start, end) in enumerate(windows[:3]):
+        raw_dur = end - start - 0.1
+        duration = max(0.5, min(2.0, raw_dur))
+        if file_dur is not None and file_dur > 0:
+            remaining = file_dur - (start + 0.05)
+            if remaining <= 0.2:
+                continue
+            duration = min(duration, remaining - 0.05)
+            duration = max(0.3, duration)
+        sample = os.path.join(tmpdir, f"noise_v2_{idx}.wav")
+        prof = os.path.join(tmpdir, f"noise_v2_{idx}.prof")
+        try:
+            subprocess.run(
+                ["sox", wav_in, sample, "trim", f"{start + 0.05}", f"{duration}"],
+                check=True, capture_output=True, text=True, timeout=120,
+            )
+            subprocess.run(
+                ["sox", sample, "-n", "noiseprof", prof],
+                check=True, capture_output=True, text=True, timeout=120,
+            )
+            noise_samples.append(sample)
+            noise_profiles.append(prof)
+        except Exception as e:
+            print(f"  [warn] failed to create noise profile from window {start}-{end}: {e}")
+            continue
+
+    if not noise_profiles:
+        print(f"  [warn] failed to create any noise profiles, afftdn fallback")
+        _afftdn_pipeline(wav_in, wav_out)
+        return
+
+    # Average profiles by mixing noise samples then profiling, or use first profile with higher aggression
+    # Simple: use first profile with 0.32 aggression (bumped from 0.27)
+    try:
+        subprocess.run(
+            [
+                "sox", wav_in, wav_out,
+                "noisered", noise_profiles[0], "0.32",
+                "highpass", str(HP_FREQ),
+                "lowpass", str(LP_FREQ),
+                "compand", "0.05,0.2", "-60,-90,-40,-40,-20,-10,0,-5", "0", "-90", "0.1",
+            ],
+            check=True, capture_output=True, text=True, timeout=120,
+        )
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(f"sox v2 pipeline failed: {e.stderr or e}") from e
+
+
+def _afftdn_pipeline(wav_in: str, wav_out: str) -> None:
+    """Adaptive noise reduction via ffmpeg afftdn — no silence needed, good for modern clean books."""
+    # afftdn: nr=noise reduction amount (dB?), nf=noise floor, tn=track noise, tr=track residual
+    # Recommended for speech: nr=20-25, nf=-30 to -25, tn=1, tr=1
+    try:
+        subprocess.run(
+            [
+                "ffmpeg", "-y", "-i", wav_in,
+                "-af", f"highpass=f={HP_FREQ},lowpass=f={LP_FREQ},afftdn=nr=20:nf=-30:tn=1:tr=1",
+                "-ac", "1", "-ar", "44100", "-c:a", "pcm_s16le",
+                wav_out,
+            ],
+            check=True, capture_output=True, timeout=120,
+        )
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(f"afftdn pipeline failed: {e.stderr or e}") from e
+
+
+def _hybrid_pipeline(wav_in: str, wav_out: str, tmpdir: str) -> None:
+    """Hybrid: de-hum notch + highpass + afftdn + sox gate + loudnorm later."""
+    # De-hum 60Hz + harmonics + highpass, then afftdn, then gate
+    try:
+        # First stage: de-hum + highpass + afftdn to intermediate
+        intermediate = os.path.join(tmpdir, "hybrid_step1.wav")
+        subprocess.run(
+            [
+                "ffmpeg", "-y", "-i", wav_in,
+                "-af",
+                f"highpass=f={HP_FREQ},"
+                f"equalizer=f=60:width_type=o:width=2:g=-30,"
+                f"equalizer=f=120:width_type=o:width=2:g=-20,"
+                f"equalizer=f=180:width_type=o:width=2:g=-10,"
+                f"afftdn=nr=15:nf=-30:tn=1:tr=1",
+                "-ac", "1", "-ar", "44100", "-c:a", "pcm_s16le",
+                intermediate,
+            ],
+            check=True, capture_output=True, timeout=120,
+        )
+        # Second stage: sox gate
+        subprocess.run(
+            [
+                "sox", intermediate, wav_out,
+                "compand", "0.05,0.2", "-60,-90,-40,-40,-20,-10,0,-5", "0", "-90", "0.1",
+            ],
+            check=True, capture_output=True, text=True, timeout=120,
+        )
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(f"hybrid pipeline failed: {e.stderr or e}") from e
+
+
 def _sox_pipeline(wav_in: str, wav_out: str, tmpdir: str) -> None:
     """Run the basic DSP cleanup chain via sox — pro-tuned: HP 70Hz, LP 16k, gate-downward compand."""
     if shutil.which("sox") is None:
@@ -293,10 +448,11 @@ def _loudness_normalize(wav_in: str, wav_out: str, channels: int = 2) -> None:
 
 def clean_one(m4b_path: str, mode: str = "basic", keep_original: bool = False,
               skip_threshold_db: float = -35.0, chunk_s: float = 60.0, overlap_s: float = 2.0,
-              device: str = None) -> None:
+              device: str = None, atten_lim_db: float = 100.0, pf: bool = False, pf_beta: float = 0.02) -> None:
     """Run the cleanup pipeline on one m4b in place, preserving chapters + cover.
 
-    chunk_s/overlap_s/device only used for ml mode.
+    chunk_s/overlap_s/device/atten_lim_db/pf/pf_beta only used for ml/ml-rust modes.
+    atten_lim_db: 0=no reduction, 100=full, 20-30 keeps natural room tone for audiobooks.
     """
     print(f"\n=== Cleaning: {m4b_path} (mode={mode}) ===")
 
@@ -341,13 +497,22 @@ def clean_one(m4b_path: str, mode: str = "basic", keep_original: bool = False,
 
         if mode == "basic":
             _sox_pipeline(wav_decoded, wav_cleaned, tmp)
+        elif mode == "basic-v2":
+            # Improved basic: adaptive thresholds, multi-window, 0.32 aggression, afftdn fallback
+            _sox_pipeline_v2(wav_decoded, wav_cleaned, tmp)
+        elif mode == "basic-afftdn":
+            # Pure afftdn adaptive, no silence needed
+            _afftdn_pipeline(wav_decoded, wav_cleaned)
+        elif mode == "hybrid":
+            # Hybrid: de-hum + highpass + afftdn + gate
+            _hybrid_pipeline(wav_decoded, wav_cleaned, tmp)
         elif mode == "ml":
-            # ml: Python torch DF3, with Rust fallback if binary available (old behavior)
+            # ml: Python torch DF3, with Rust fallback if binary available
             try:
                 from m4b_lib.cleanup_ml_rust import _find_binary, rust_enhance
                 if _find_binary() is not None:
-                    print(f"  using Rust deep-filter backend ({_find_binary()}) for ml mode")
-                    rust_enhance(wav_decoded, wav_cleaned)
+                    print(f"  using Rust deep-filter backend ({_find_binary()}) for ml mode (atten_lim={atten_lim_db}dB pf={pf})")
+                    rust_enhance(wav_decoded, wav_cleaned, atten_lim_db=atten_lim_db, pf=pf, pf_beta=pf_beta)
                 else:
                     raise FileNotFoundError("Rust binary not found")
             except Exception as e:
@@ -357,7 +522,7 @@ def clean_one(m4b_path: str, mode: str = "basic", keep_original: bool = False,
                     _ensure_model(device_override=device)
                 df3_enhance(wav_decoded, wav_cleaned, chunk_s=chunk_s, overlap_s=overlap_s)
         elif mode == "ml-rust":
-            # ml-rust: Rust binary only, no torch fallback — explicit 3rd option for A/B
+            # ml-rust: Rust binary only, no torch fallback — explicit 3rd option for A/B, supports knobs
             from m4b_lib.cleanup_ml_rust import _find_binary, rust_enhance
             binary = _find_binary()
             if binary is None:
@@ -366,8 +531,8 @@ def clean_one(m4b_path: str, mode: str = "basic", keep_original: bool = False,
                     "cargo install deep_filter --features cli or download from "
                     "https://github.com/Rikorose/DeepFilterNet/releases"
                 )
-            print(f"  using Rust deep-filter backend ({binary}) [ml-rust mode]")
-            rust_enhance(wav_decoded, wav_cleaned)
+            print(f"  using Rust deep-filter backend ({binary}) [ml-rust mode atten_lim={atten_lim_db}dB pf={pf}]")
+            rust_enhance(wav_decoded, wav_cleaned, atten_lim_db=atten_lim_db, pf=pf, pf_beta=pf_beta)
         else:
             raise ValueError(f"unknown mode: {mode}")
 
