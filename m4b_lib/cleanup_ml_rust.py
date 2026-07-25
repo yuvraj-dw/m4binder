@@ -45,7 +45,11 @@ def rust_enhance(wav_in: str, wav_out: str, model: str = "DeepFilterNet3") -> No
     # Actually deep-filter: deep-filter --output-dir <dir> <input> -> creates <dir>/<basename>.wav
     # We'll use a dedicated temp out dir
     with tempfile.TemporaryDirectory(prefix="deepfilter_") as tmp_out_dir:
-        cmd = [binary, "--model", model, "--output-dir", tmp_out_dir, wav_in]
+        # Default model is DeepFilterNet3, don't pass --model unless custom tar.gz path
+        if model and model != "DeepFilterNet3" and os.path.isfile(model):
+            cmd = [binary, "--model", model, "--output-dir", tmp_out_dir, wav_in]
+        else:
+            cmd = [binary, "--output-dir", tmp_out_dir, wav_in]
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
         if result.returncode != 0:
             raise RuntimeError(f"deep-filter failed: {result.stderr[:1000]}")

@@ -320,8 +320,8 @@ def clean_one(m4b_path: str, mode: str = "basic", keep_original: bool = False,
 
         # Choose decode params based on mode to avoid unnecessary resampling
         # Both modes now decode mono for final mono 64k standard (pro audiobook mono)
-        # Basic: 1ch 44.1k keeps native SR, ML: 1ch 48k matches DF3 native
-        if mode == "ml":
+        # Basic: 1ch 44.1k keeps native SR, ML/ML-Rust: 1ch 48k matches DF3 native
+        if mode in ("ml", "ml-rust"):
             _decode_to_wav(m4b_path, wav_decoded, channels=1, sample_rate=48000)
         else:
             _decode_to_wav(m4b_path, wav_decoded, channels=1, sample_rate=44100)
@@ -342,11 +342,11 @@ def clean_one(m4b_path: str, mode: str = "basic", keep_original: bool = False,
         if mode == "basic":
             _sox_pipeline(wav_decoded, wav_cleaned, tmp)
         elif mode == "ml":
-            # Prefer Rust binary if available (no torch dep, low RAM, built-in streaming)
+            # ml: Python torch DF3, with Rust fallback if binary available (old behavior)
             try:
                 from m4b_lib.cleanup_ml_rust import _find_binary, rust_enhance
                 if _find_binary() is not None:
-                    print(f"  using Rust deep-filter backend ({_find_binary()})")
+                    print(f"  using Rust deep-filter backend ({_find_binary()}) for ml mode")
                     rust_enhance(wav_decoded, wav_cleaned)
                 else:
                     raise FileNotFoundError("Rust binary not found")
@@ -356,6 +356,18 @@ def clean_one(m4b_path: str, mode: str = "basic", keep_original: bool = False,
                 if device:
                     _ensure_model(device_override=device)
                 df3_enhance(wav_decoded, wav_cleaned, chunk_s=chunk_s, overlap_s=overlap_s)
+        elif mode == "ml-rust":
+            # ml-rust: Rust binary only, no torch fallback — explicit 3rd option for A/B
+            from m4b_lib.cleanup_ml_rust import _find_binary, rust_enhance
+            binary = _find_binary()
+            if binary is None:
+                raise FileNotFoundError(
+                    "deep-filter Rust binary not found in PATH — install via "
+                    "cargo install deep_filter --features cli or download from "
+                    "https://github.com/Rikorose/DeepFilterNet/releases"
+                )
+            print(f"  using Rust deep-filter backend ({binary}) [ml-rust mode]")
+            rust_enhance(wav_decoded, wav_cleaned)
         else:
             raise ValueError(f"unknown mode: {mode}")
 
