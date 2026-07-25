@@ -31,8 +31,8 @@ def _add_clean_parser(sub):
     p = sub.add_parser("clean", help="Clean/restore an existing m4b file")
     p.add_argument("--input", required=True, help="Path to a .m4b file or a directory of them")
     p.add_argument("--pattern", default="*.m4b", help="Glob when --input is a directory")
-    p.add_argument("--mode", choices=["basic", "ml"], default="basic",
-                   help="basic: sox (safe, CPU, 1MB), ml: DeepFilterNet3 (aggressive, torch 2GB or Rust binary)")
+    p.add_argument("--mode", choices=["basic", "ml", "ml-rust"], default="basic",
+                   help="basic: sox (safe, CPU, 1MB), ml: DeepFilterNet3 torch (aggressive, 2GB), ml-rust: DeepFilterNet3 Rust binary (15MB, no torch, low RAM, preferred for batch)")
     p.add_argument("--keep-original", action="store_true",
                    help="Save original as <name>.orig.m4b instead of replacing in place")
     p.add_argument("--skip-threshold-db", type=float, default=-35.0,
