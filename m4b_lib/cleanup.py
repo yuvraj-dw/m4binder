@@ -446,13 +446,15 @@ def _loudness_normalize(wav_in: str, wav_out: str, channels: int = 2) -> None:
     )
 
 
-def clean_one(m4b_path: str, mode: str = "basic", keep_original: bool = False,
+def clean_one(m4b_path: str, mode: str = "auto", keep_original: bool = False,
               skip_threshold_db: float = -35.0, chunk_s: float = 60.0, overlap_s: float = 2.0,
-              device: str = None, atten_lim_db: float = 100.0, pf: bool = False, pf_beta: float = 0.02) -> None:
+              device: str = None, atten_lim_db: str = "12", pf: bool = False, pf_beta: float = 0.02) -> None:
     """Run the cleanup pipeline on one m4b in place, preserving chapters + cover.
 
-    chunk_s/overlap_s/device/atten_lim_db/pf/pf_beta only used for ml/ml-rust modes.
-    atten_lim_db: 0=no reduction, 100=full, 20-30 keeps natural room tone for audiobooks.
+    Single best pipeline (no fallback, no v2): ml-rust 12dB, HP70, two-pass -19 LUFS TP -2 LRA7 mono 64k.
+    Mode param is kept for backward compat but ignored — always does best (ml-rust 12dB).
+    For v2.0 single set, clean does auto best: ml-rust 12dB is default per listening tests 6->12 perceptible, 12->100 same.
+    Advanced knobs still allowed: atten_lim_db (0-100 or auto), pf, chunk_s, etc.
     """
     print(f"\n=== Cleaning: {m4b_path} (mode={mode}) ===")
 
@@ -495,46 +497,46 @@ def clean_one(m4b_path: str, mode: str = "basic", keep_original: bool = False,
         else:
             print(f"  no cover found (will be stripped)")
 
-        if mode == "basic":
-            _sox_pipeline(wav_decoded, wav_cleaned, tmp)
-        elif mode == "basic-v2":
-            # Improved basic: adaptive thresholds, multi-window, 0.32 aggression, afftdn fallback
-            _sox_pipeline_v2(wav_decoded, wav_cleaned, tmp)
-        elif mode == "basic-afftdn":
-            # Pure afftdn adaptive, no silence needed
-            _afftdn_pipeline(wav_decoded, wav_cleaned)
-        elif mode == "hybrid":
-            # Hybrid: de-hum + highpass + afftdn + gate
-            _hybrid_pipeline(wav_decoded, wav_cleaned, tmp)
-        elif mode == "ml":
-            # ml: Python torch DF3, with Rust fallback if binary available
-            try:
-                from m4b_lib.cleanup_ml_rust import _find_binary, rust_enhance
-                if _find_binary() is not None:
-                    print(f"  using Rust deep-filter backend ({_find_binary()}) for ml mode (atten_lim={atten_lim_db}dB pf={pf})")
-                    rust_enhance(wav_decoded, wav_cleaned, atten_lim_db=atten_lim_db, pf=pf, pf_beta=pf_beta)
-                else:
-                    raise FileNotFoundError("Rust binary not found")
-            except Exception as e:
-                print(f"  Rust backend not available ({e}), falling back to Python torch DF3")
-                from m4b_lib.cleanup_ml import df3_enhance, _ensure_model
-                if device:
-                    _ensure_model(device_override=device)
-                df3_enhance(wav_decoded, wav_cleaned, chunk_s=chunk_s, overlap_s=overlap_s)
-        elif mode == "ml-rust":
-            # ml-rust: Rust binary only, no torch fallback — explicit 3rd option for A/B, supports knobs
-            from m4b_lib.cleanup_ml_rust import _find_binary, rust_enhance
+        # Single best pipeline — ml-rust 12dB, HP70, two-pass -19 LUFS mono 64k
+        # Mode param ignored for backward compat (basic worthless, torch deleted), always does best
+        from m4b_lib.cleanup_ml_rust import _find_binary, rust_enhance, ensure_rust_binary
+
+        # Auto-install Rust binary if missing (like ffmpeg guidance)
+        try:
             binary = _find_binary()
             if binary is None:
-                raise FileNotFoundError(
-                    "deep-filter Rust binary not found in PATH — install via "
-                    "cargo install deep_filter --features cli or download from "
-                    "https://github.com/Rikorose/DeepFilterNet/releases"
-                )
-            print(f"  using Rust deep-filter backend ({binary}) [ml-rust mode atten_lim={atten_lim_db}dB pf={pf}]")
-            rust_enhance(wav_decoded, wav_cleaned, atten_lim_db=atten_lim_db, pf=pf, pf_beta=pf_beta)
+                print(f"  Rust binary not found, auto-installing deep-filter to ~/.local/bin/...")
+                binary = ensure_rust_binary()
+        except Exception as e:
+            print(f"  Auto-install failed ({e}), trying direct detection...")
+            binary = _find_binary()
+
+        if binary is None:
+            raise FileNotFoundError(
+                "deep-filter Rust binary not found — install via:\n"
+                "  cargo install deep_filter\n"
+                "or download release from https://github.com/Rikorose/DeepFilterNet/releases\n"
+                "Binary will be auto-installed to ~/.local/bin/deep-filter on first run if internet available"
+            )
+
+        # Handle atten-lim auto
+        if isinstance(atten_lim_db, str) and str(atten_lim_db).lower() == "auto":
+            print(f"  estimating optimal atten-lim (auto) from SNR...")
+            optimal, info = ffmpeg_utils.estimate_optimal_atten_lim(m4b_path)
+            if optimal is not None:
+                print(f"  auto atten-lim: SNR {info.get('snr'):.1f}dB (noise max {info.get('noise_max'):.1f} vs overall {info.get('overall'):.1f}) -> {optimal}dB")
+                atten_lim_db = optimal
+            else:
+                print(f"  auto estimation failed, fallback to 12dB best")
+                atten_lim_db = 12.0
         else:
-            raise ValueError(f"unknown mode: {mode}")
+            try:
+                atten_lim_db = float(atten_lim_db)
+            except:
+                atten_lim_db = 12.0
+
+        print(f"  using Rust deep-filter backend ({binary}) [best: atten_lim={atten_lim_db}dB pf={pf} chunk={chunk_s}s]")
+        rust_enhance(wav_decoded, wav_cleaned, atten_lim_db=atten_lim_db, pf=pf, pf_beta=pf_beta)
 
         # Loudness normalize — unified mono 64k standard for audiobooks (pro: 64k mono = higher quality per channel than 64k stereo)
         _loudness_normalize(wav_cleaned, wav_normalized, channels=1)

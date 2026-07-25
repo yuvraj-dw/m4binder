@@ -22,7 +22,73 @@ def _find_binary() -> Optional[str]:
         path = shutil.which(name)
         if path:
             return path
+    # Also check common local paths
+    for p in [os.path.expanduser("~/.cargo/bin/deep-filter"), os.path.expanduser("~/.local/bin/deep-filter")]:
+        if os.path.isfile(p) and os.access(p, os.X_OK):
+            return p
     return None
+
+
+def ensure_rust_binary(version: str = "v0.5.6") -> str:
+    """Auto-install Rust deep-filter binary if missing, like ffmpeg guidance.
+
+    Downloads musl static binary for Linux x86_64 from GitHub releases to ~/.local/bin/deep-filter.
+    Returns path to binary.
+    """
+    existing = _find_binary()
+    if existing:
+        return existing
+
+    import platform
+    system = platform.system().lower()
+    machine = platform.machine().lower()
+
+    # Only auto-install for Linux x86_64 for now, else error with instructions
+    if system != "linux" or machine not in ("x86_64", "amd64"):
+        raise FileNotFoundError(
+            f"Auto-install only supports Linux x86_64, detected {system} {machine}. "
+            "Install manually: cargo install deep_filter or download from "
+            "https://github.com/Rikorose/DeepFilterNet/releases"
+        )
+
+    # Use musl static which works everywhere
+    url = f"https://github.com/Rikorose/DeepFilterNet/releases/download/{version}/deep-filter-{version}-x86_64-unknown-linux-musl"
+    dest_dir = os.path.expanduser("~/.local/bin")
+    os.makedirs(dest_dir, exist_ok=True)
+    dest_path = os.path.join(dest_dir, "deep-filter")
+
+    print(f"  downloading deep-filter {version} from {url} to {dest_path}...")
+
+    # Download via curl or python requests
+    try:
+        import requests
+        r = requests.get(url, stream=True, timeout=60)
+        r.raise_for_status()
+        with open(dest_path, "wb") as f:
+            for chunk in r.iter_content(chunk_size=8192):
+                f.write(chunk)
+    except Exception:
+        # Fallback to curl via subprocess
+        result = subprocess.run(["curl", "-L", "-o", dest_path, url], capture_output=True, text=True, timeout=120)
+        if result.returncode != 0 or not os.path.exists(dest_path):
+            raise FileNotFoundError(f"Failed to download deep-filter from {url}: {result.stderr[:500]}")
+
+    os.chmod(dest_path, 0o755)
+
+    # Ensure dest_dir in PATH for future which checks — add to PATH env for current process
+    os.environ["PATH"] = dest_dir + os.pathsep + os.environ.get("PATH", "")
+
+    # Verify
+    if not os.path.isfile(dest_path):
+        raise FileNotFoundError(f"Auto-install failed, {dest_path} not found")
+
+    # Test run --help to ensure binary works and model will be downloaded later
+    try:
+        subprocess.run([dest_path, "--help"], capture_output=True, timeout=10)
+    except Exception:
+        pass
+
+    return dest_path
 
 
 def rust_enhance(wav_in: str, wav_out: str, model: str = "DeepFilterNet3",
