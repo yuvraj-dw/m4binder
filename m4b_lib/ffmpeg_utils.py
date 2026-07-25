@@ -316,6 +316,106 @@ def probe_noise_floor(audio_path: str) -> Optional[float]:
         return None
 
 
+def _find_silence_windows_for_atten(wav_path: str, thresholds: list[int] = [-40, -35, -30, -25], min_dur: float = 0.5) -> list[tuple[float, float]]:
+    """Adaptive silence finder for auto atten-lim: try thresholds strict to loose."""
+    all_windows = []
+    for db in thresholds:
+        r = subprocess.run(
+            ["ffmpeg", "-i", wav_path, "-af", f"silencedetect=noise={db}dB:d={min_dur}", "-f", "null", "-"],
+            capture_output=True, text=True, timeout=120,
+        )
+        starts = re.findall(r"silence_start:\s*([\d.]+)", r.stderr)
+        ends = re.findall(r"silence_end:\s*([\d.]+)", r.stderr)
+        for s, e in zip(starts, ends):
+            try:
+                s_f, e_f = float(s), float(e)
+                if e_f - s_f >= min_dur:
+                    all_windows.append((s_f, e_f))
+            except:
+                continue
+        if len(all_windows) >= 3:
+            break
+    all_windows = sorted(set(all_windows), key=lambda x: x[1]-x[0], reverse=True)
+    filtered = []
+    for s, e in all_windows:
+        if not any(abs(s-fs) < 0.1 and abs(e-fe) < 0.1 for fs, fe in filtered):
+            overlap = any(not (e <= fs or s >= fe) for fs, fe in filtered)
+            if not overlap or len(filtered) < 2:
+                filtered.append((s, e))
+        if len(filtered) >= 5:
+            break
+    return filtered
+
+
+def estimate_optimal_atten_lim(m4b_path: str, margin_db: float = 3.0) -> tuple[Optional[float], dict]:
+    """Estimate optimal attenuation limit for deep-filter based on SNR of silence vs speech.
+
+    Returns (optimal_atten_db, info_dict) where info contains noise_max, overall, snr, windows.
+    Uses max (least quiet) silence window as representative hiss, not average of deepest silence.
+    Clamped to 6-30 dB for audiobooks (6=no NR, 30=keeps room tone, 100=full would be overkill per user test).
+    """
+    import tempfile
+    info = {"file": os.path.basename(m4b_path), "windows": [], "noise_vals": [], "noise_max": None, "overall": None, "snr": None, "optimal": None}
+
+    with tempfile.TemporaryDirectory(prefix="atten_est_") as tmp:
+        wav = os.path.join(tmp, "tmp.wav")
+        r = subprocess.run(
+            ["ffmpeg", "-y", "-i", m4b_path, "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", wav],
+            capture_output=True, text=True, timeout=120,
+        )
+        if not os.path.exists(wav):
+            return None, info
+
+        windows = _find_silence_windows_for_atten(wav)
+        info["windows"] = windows
+        if not windows:
+            info["optimal"] = 20.0
+            return 20.0, info
+
+        noise_vals = []
+        for s, e in windows[:3]:
+            dur = e - s
+            r = subprocess.run(
+                ["ffmpeg", "-ss", str(s), "-i", wav, "-t", str(dur), "-af", "volumedetect", "-vn", "-f", "null", "-"],
+                capture_output=True, text=True, timeout=30,
+            )
+            m = re.search(r"mean_volume:\s*(-?\d+(?:\.\d+)?)", r.stderr)
+            if m:
+                try:
+                    noise_vals.append(float(m.group(1)))
+                except:
+                    pass
+
+        if not noise_vals:
+            info["optimal"] = 20.0
+            return 20.0, info
+
+        info["noise_vals"] = noise_vals
+        noise_max = max(noise_vals)
+        info["noise_max"] = noise_max
+
+        overall = probe_noise_floor(wav)
+        if overall is None:
+            r = subprocess.run(
+                ["ffmpeg", "-i", wav, "-af", "volumedetect", "-vn", "-f", "null", "-"],
+                capture_output=True, text=True, timeout=60,
+            )
+            m = re.search(r"mean_volume:\s*(-?\d+(?:\.\d+)?)", r.stderr)
+            if m:
+                overall = float(m.group(1))
+
+        info["overall"] = overall
+        if overall is None:
+            info["optimal"] = 20.0
+            return 20.0, info
+
+        snr = overall - noise_max
+        info["snr"] = snr
+        optimal = max(6.0, min(30.0, round(snr + margin_db)))
+        info["optimal"] = optimal
+        return optimal, info
+
+
 def extract_cover(m4b_path: str, max_size: int = 20 * 1024 * 1024) -> Optional[bytes]:
     """Extract attached picture / cover art bytes from an m4b if present, capped at max_size."""
     import tempfile
