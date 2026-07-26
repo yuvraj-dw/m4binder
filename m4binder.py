@@ -48,23 +48,25 @@ def _add_migrate_parser(sub):
 
 
 def _add_clean_parser(sub):
-    p = sub.add_parser("clean", help="Clean/restore an existing m4b file — best pipeline: ml-rust 12dB, HP70, two-pass -19 LUFS mono 64k")
+    p = sub.add_parser("clean", help="Clean/restore an existing m4b — best single set: ml-rust 12dB, now with torch GPU option")
     p.add_argument("--input", required=True, help="Path to a .m4b file or a directory of them")
     p.add_argument("--pattern", default="*.m4b", help="Glob when --input is a directory")
+    p.add_argument("--mode", choices=["auto", "ml", "ml-rust", "ml-torch", "basic"], default="auto",
+                   help="auto: best available (prefers GPU torch if CUDA else Rust), ml: auto-detect GPU torch else Rust, ml-rust: Rust CPU low RAM 35M, ml-torch: Torch GPU 2x faster 2GB VRAM, basic: legacy sox (almost worthless)")
     p.add_argument("--keep-original", action="store_true",
                    help="Save original as <name>.orig.m4b instead of replacing in place")
     p.add_argument("--skip-threshold-db", type=float, default=-35.0,
-                   help="Skip files with mean volume below this dB (i.e. already-quiet)")
-    p.add_argument("--overwrite", action="store_true", help="Allow overwriting existing backup files")
-    p.add_argument("--chunk-s", type=float, default=60.0, help="Chunk size seconds (default 60s, best)")
-    p.add_argument("--overlap-s", type=float, default=2.0, help="Overlap seconds (default 2s, equal-power sin/cos)")
-    p.add_argument("--device", default=None, help="Device override: cpu, cuda, or auto (default auto)")
-    p.add_argument("--atten-lim", default="12", help="Attenuation limit dB 0-100 or auto (default 12 best per listening tests: 6->12 perceptible, 12->100 same, auto estimates per-file SNR)")
-    p.add_argument("--pf", action="store_true", help="Enable post-filter (over-attenuates, keep off for audiobooks)")
-    p.add_argument("--pf-beta", type=float, default=0.02, help="Post-filter beta (default 0.02, higher stronger)")
-    p.add_argument("--dry-run", action="store_true", help="List files that would be cleaned without cleaning")
-    p.add_argument("--jobs", type=int, default=1, help="Parallel jobs for batch clean (default 1)")
-    p.add_argument("--auto", action="store_true", help="Use best values (same as default, kept for compatibility)")
+                   help="Skip files with mean volume below this dB")
+    p.add_argument("--overwrite", action="store_true", help="Allow overwriting")
+    p.add_argument("--chunk-s", type=float, default=60.0, help="Chunk size seconds (default 60s)")
+    p.add_argument("--overlap-s", type=float, default=2.0, help="Overlap seconds (default 2s equal-power)")
+    p.add_argument("--device", default=None, help="Device override: cpu, cuda, auto (default auto)")
+    p.add_argument("--atten-lim", default="12", help="Attenuation limit 0-100 or auto (default 12 best: 6->12 perceptible, 12->100 same)")
+    p.add_argument("--pf", action="store_true", help="Post-filter over-attenuates, keep off")
+    p.add_argument("--pf-beta", type=float, default=0.02, help="Post-filter beta")
+    p.add_argument("--dry-run", action="store_true", help="List files that would be cleaned")
+    p.add_argument("--jobs", type=int, default=1, help="Parallel jobs for batch or chapter-parallel (e.g., --jobs 8 for 30h book 49 chapters)")
+    p.add_argument("--auto", action="store_true", help="Alias for --mode auto (best)")
     return p
 
 

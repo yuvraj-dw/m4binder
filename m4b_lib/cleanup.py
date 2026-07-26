@@ -526,29 +526,26 @@ def clean_one(m4b_path: str, mode: str = "auto", keep_original: bool = False,
         else:
             print(f"  no cover found (will be stripped)")
 
-        # Single best pipeline — ml-rust 12dB, HP70, two-pass -19 LUFS mono 64k
-        from m4b_lib.cleanup_ml_rust import _find_binary, rust_enhance, ensure_rust_binary
+        # Determine backend: ml-rust (Rust CPU, low RAM), ml-torch (Torch GPU, 2x faster), ml/auto (auto-select GPU if available else Rust)
+        # Single best single set is ml-rust 12dB, but torch GPU is too good to pass up per user request
+        mode = (mode or "auto").lower()
+        if mode in ("auto", "best"):
+            # Auto-select best available: prefer GPU torch if CUDA available for speed, else Rust for low RAM
+            try:
+                import torch
+                if torch.cuda.is_available() and (device is None or device != "cpu"):
+                    mode = "ml-torch"
+                else:
+                    mode = "ml-rust"
+            except:
+                mode = "ml-rust"
 
-        try:
-            binary = _find_binary()
-            if binary is None:
-                print(f"  Rust binary not found, auto-installing deep-filter to ~/.local/bin/...")
-                binary = ensure_rust_binary()
-        except Exception as e:
-            print(f"  Auto-install failed ({e}), trying direct detection...")
-            binary = _find_binary()
-
-        if binary is None:
-            raise FileNotFoundError(
-                "deep-filter Rust binary not found — install via cargo install deep_filter or download release"
-            )
-
-        # Handle atten-lim auto
+        # Handle atten-lim auto for both backends
         if isinstance(atten_lim_db, str) and str(atten_lim_db).lower() == "auto":
             print(f"  estimating optimal atten-lim (auto) from SNR...")
             optimal, info = ffmpeg_utils.estimate_optimal_atten_lim(m4b_path)
             if optimal is not None:
-                print(f"  auto atten-lim: SNR {info.get('snr'):.1f}dB -> {optimal}dB")
+                print(f"  auto atten-lim: SNR {info.get('snr'):.1f}dB (noise max {info.get('noise_max'):.1f} vs overall {info.get('overall'):.1f}) -> {optimal}dB")
                 atten_lim_db = optimal
             else:
                 atten_lim_db = 12.0
@@ -557,6 +554,50 @@ def clean_one(m4b_path: str, mode: str = "auto", keep_original: bool = False,
                 atten_lim_db = float(atten_lim_db)
             except:
                 atten_lim_db = 12.0
+
+        # Resolve backend
+        if mode in ("ml-rust", "rust", "ml_rust"):
+            from m4b_lib.cleanup_ml_rust import _find_binary, rust_enhance, ensure_rust_binary
+            try:
+                binary = _find_binary()
+                if binary is None:
+                    print(f"  Rust binary not found, auto-installing deep-filter to ~/.local/bin/...")
+                    binary = ensure_rust_binary()
+            except Exception as e:
+                print(f"  Auto-install failed ({e}), trying direct detection...")
+                binary = _find_binary()
+            if binary is None:
+                raise FileNotFoundError("deep-filter Rust binary not found — install via cargo install deep_filter")
+            backend = "rust"
+            print(f"  using Rust deep-filter backend ({binary}) [best: atten_lim={atten_lim_db}dB pf={pf} chunk={chunk_s}s]")
+        elif mode in ("ml-torch", "torch", "ml_torch", "ml"):
+            # Torch path with GPU acceleration
+            try:
+                from m4b_lib.cleanup_ml import df3_enhance, _ensure_model
+                import torch
+                cuda_available = torch.cuda.is_available()
+                if device:
+                    _ensure_model(device_override=device)
+                    print(f"  using Torch DeepFilterNet3 backend (device override {device}, cuda_available={cuda_available})")
+                else:
+                    _ensure_model()
+                    dev = "cuda" if cuda_available else "cpu"
+                    print(f"  using Torch DeepFilterNet3 backend (auto device {dev}, cuda_available={cuda_available}) [best: chunk={chunk_s}s]")
+                backend = "torch"
+                if atten_lim_db != 100.0:
+                    print(f"  [warn] torch backend ignores atten-lim {atten_lim_db}dB, does full NR (100dB). Use ml-rust for tunable atten-lim.")
+            except ImportError as e:
+                print(f"  Torch backend not available ({e}), falling back to Rust")
+                from m4b_lib.cleanup_ml_rust import _find_binary, rust_enhance, ensure_rust_binary
+                binary = _find_binary() or ensure_rust_binary()
+                backend = "rust"
+                print(f"  using Rust deep-filter backend ({binary}) [fallback]")
+        else:
+            # Fallback for old basic modes: map to ml-rust best (basic worthless per user)
+            print(f"  [warn] mode {mode} deprecated, using best ml-rust 12dB")
+            from m4b_lib.cleanup_ml_rust import _find_binary, rust_enhance, ensure_rust_binary
+            binary = _find_binary() or ensure_rust_binary()
+            backend = "rust"
 
         # Chapter-parallel cleaning if file has many chapters and jobs>1
         chapters = _get_chapters_json(m4b_path)
@@ -593,23 +634,20 @@ def clean_one(m4b_path: str, mode: str = "auto", keep_original: bool = False,
 
             def _clean_chapter(args):
                 wav_in, wav_out = args
-                rust_enhance(wav_in, wav_out, atten_lim_db=atten_lim_db, pf=pf, pf_beta=pf_beta)
+                if backend == "rust":
+                    rust_enhance(wav_in, wav_out, atten_lim_db=atten_lim_db, pf=pf, pf_beta=pf_beta)
+                else:
+                    # Torch backend with GPU acceleration
+                    from m4b_lib.cleanup_ml import df3_enhance
+                    df3_enhance(wav_in, wav_out, chunk_s=chunk_s, overlap_s=overlap_s)
                 return wav_out
 
             with ThreadPoolExecutor(max_workers=jobs) as ex:
                 results = list(ex.map(_clean_chapter, cleaned_chapter_wavs))
 
             # Concat cleaned chapter wavs in order to wav_cleaned
-            listfile = os.path.join(tmp, "chapters_concat.txt")
-            with open(listfile, "w", encoding="utf-8") as f:
-                for _, cleaned in sorted(cleaned_chapter_wavs, key=lambda x: x[0]):
-                    # cleaned path is second element, but we need to ensure order by original chapter index
-                    # cleaned_chapter_wavs already in order, use cleaned path
-                    safe = cleaned.replace("\\", "\\\\").replace("'", r"'\''")
-                    f.write(f"file '{safe}'\n")
-
-            # Actually need list of cleaned wavs in chapter order
             cleaned_only = [c for _, c in cleaned_chapter_wavs]
+            listfile = os.path.join(tmp, "chapters_concat.txt")
             with open(listfile, "w", encoding="utf-8") as f:
                 for p in cleaned_only:
                     safe = p.replace("\\", "\\\\").replace("'", r"'\''")
@@ -619,14 +657,18 @@ def clean_one(m4b_path: str, mode: str = "auto", keep_original: bool = False,
                 ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", listfile, "-c", "copy", wav_cleaned],
                 check=True, capture_output=True, timeout=300,
             )
-            print(f"  cleaned {len(chapters)} chapters in parallel, concatenated to {wav_cleaned}")
+            print(f"  cleaned {len(chapters)} chapters in parallel ({backend}) -> {wav_cleaned}")
 
         else:
-            # Fallback: decode whole file to wav then clean (original path)
-            # Choose decode params: 1ch 48k for ml-rust best
+            # Fallback: decode whole file to wav then clean
             _decode_to_wav(m4b_path, wav_decoded, channels=1, sample_rate=48000)
-            print(f"  using Rust deep-filter backend ({binary}) [best: atten_lim={atten_lim_db}dB pf={pf} chunk={chunk_s}s]")
-            rust_enhance(wav_decoded, wav_cleaned, atten_lim_db=atten_lim_db, pf=pf, pf_beta=pf_beta)
+            if backend == "rust":
+                print(f"  using Rust deep-filter backend ({binary}) [best: atten_lim={atten_lim_db}dB pf={pf} chunk={chunk_s}s]")
+                rust_enhance(wav_decoded, wav_cleaned, atten_lim_db=atten_lim_db, pf=pf, pf_beta=pf_beta)
+            else:
+                print(f"  using Torch DeepFilterNet3 backend [GPU accelerated if available, chunk={chunk_s}s]")
+                from m4b_lib.cleanup_ml import df3_enhance
+                df3_enhance(wav_decoded, wav_cleaned, chunk_s=chunk_s, overlap_s=overlap_s)
 
         # Loudness normalize — unified mono 64k standard for audiobooks (pro: 64k mono = higher quality per channel than 64k stereo)
         _loudness_normalize(wav_cleaned, wav_normalized, channels=1)

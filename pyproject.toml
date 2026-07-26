@@ -15,14 +15,19 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Old torch-based ML removed in v2.0 — now Rust deep-filter binary only (35M, auto-installed to ~/.local/bin)
-# Kept for backward compat, but no longer used
+ml = [
+    "deepfilternet==0.5.6",
+    "soundfile==0.13.1",
+    "torch==2.6.0",
+    "torchaudio==2.6.0",
+]
 ml-legacy = [
     "deepfilternet==0.5.6",
     "soundfile==0.13.1",
     "torch==2.6.0",
     "torchaudio==2.6.0",
 ]
+ml-rust = []  # Rust binary only, no pip deps, auto-installed
 dev = [
     "pytest==9.0.3",
 ]
