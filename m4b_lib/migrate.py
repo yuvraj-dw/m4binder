@@ -59,7 +59,6 @@ def _bind_and_clean_one(input_folder: str, output_m4b: str, bind_opts: BindOptio
         os.makedirs(wav_dir, exist_ok=True)
 
         # Parallel decode mp3s -> wavs, 1ch 48k for ml-rust best
-        # Reuse ffmpeg_utils decode but for mp3 input: we can use _decode_to_wav which works for any container
         wavs = []
         for mp3 in mp3s:
             base = os.path.splitext(os.path.basename(mp3))[0]
@@ -67,53 +66,71 @@ def _bind_and_clean_one(input_folder: str, output_m4b: str, bind_opts: BindOptio
             _decode_to_wav(mp3, wav_path, channels=1, sample_rate=48000)
             wavs.append(wav_path)
 
-        combined_wav = os.path.join(tmp, "combined.wav")
-        # Concat wavs via ffmpeg concat demuxer (need listfile)
-        # Reuse concat logic but for wav
-        listfile = os.path.join(tmp, "wav_concat.txt")
-        with open(listfile, "w", encoding="utf-8") as f:
-            for w in wavs:
-                safe = w.replace("\\", "\\\\").replace("'", r"'\''")
-                f.write(f"file '{safe}'\n")
-
-        import subprocess
-        subprocess.run(
-            ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", listfile, "-c", "copy", combined_wav],
-            check=True, capture_output=True, timeout=300,
-        )
-
-        # Chapters from mp3 durations
+        # Chapters from mp3 durations (for final embed)
         chapters_ini = os.path.join(tmp, "chapters.ini")
         ffmpeg_utils.create_chapters_ffmetadata(mp3s, chapters_ini)
 
-        # Clean combined wav with best pipeline (ml-rust 12dB)
-        cleaned_wav = os.path.join(tmp, "cleaned.wav")
-        # Use Rust backend directly for best
+        # For inbound MP3->M4B with cleaning: process chapters for cleaning in parallel, THEN merge
+        # This is optimal single lossy: each chapter wav cleaned in parallel, then concat cleaned
+        print(f"  cleaning {len(wavs)} chapter wavs in parallel (mp3->cleaned wavs, not combined yet)")
+
+        # Determine atten-lim
         try:
-            from m4b_lib.cleanup_ml_rust import _find_binary, rust_enhance
-            binary = _find_binary()
-            if binary is None:
-                raise FileNotFoundError("deep-filter binary not found")
-            # Handle auto string if passed
             atten = clean_atten_lim
             if isinstance(atten, str) and atten.lower() == "auto":
-                # Estimate optimal from combined wav
-                optimal, info = ffmpeg_utils.estimate_optimal_atten_lim(combined_wav)
+                # For auto, estimate from first chapter or combined? Use first for speed, or combined for accuracy
+                # Use first wav for quick estimate
+                optimal, info = ffmpeg_utils.estimate_optimal_atten_lim(wavs[0])
                 if optimal is not None:
                     print(f"  [auto] SNR {info.get('snr'):.1f}dB -> atten-lim {optimal}dB")
                     atten = optimal
                 else:
                     atten = 12.0
             else:
-                try:
-                    atten = float(atten)
-                except:
-                    atten = 12.0
-            print(f"  cleaning with ml-rust atten-lim {atten}dB")
-            rust_enhance(combined_wav, cleaned_wav, atten_lim_db=atten, pf=clean_atten_lim if isinstance(clean_atten_lim, bool) else clean_pf)
-        except Exception as e:
-            print(f"  Rust backend failed ({e}), falling back to afftdn")
-            _afftdn_pipeline(combined_wav, cleaned_wav)
+                atten = float(atten)
+        except:
+            atten = 12.0
+
+        # Parallel clean each chapter wav -> cleaned chapter wav
+        cleaned_wavs = []
+        for wav_path in wavs:
+            base = os.path.splitext(os.path.basename(wav_path))[0]
+            cleaned_path = os.path.join(wav_dir, base + "_cleaned.wav")
+            cleaned_wavs.append(cleaned_path)
+
+        def _clean_one_chapter(args):
+            wav_in, wav_out = args
+            try:
+                from m4b_lib.cleanup_ml_rust import _find_binary, rust_enhance
+                binary = _find_binary()
+                if binary is None:
+                    raise FileNotFoundError("deep-filter binary not found")
+                rust_enhance(wav_in, wav_out, atten_lim_db=atten, pf=clean_pf)
+                return wav_out
+            except Exception as e:
+                print(f"  Rust failed for {wav_in} ({e}), fallback afftdn")
+                _afftdn_pipeline(wav_in, wav_out)
+                return wav_out
+
+        from concurrent.futures import ThreadPoolExecutor
+        # Use ThreadPool for CPU-bound deep-filter (Rust binary is external process, so threadpool okay)
+        # For 30h book with 49 chapters avg 37min, 8 jobs = ~4x speedup
+        with ThreadPoolExecutor(max_workers=min(8, len(wavs))) as ex:
+            list(ex.map(_clean_one_chapter, zip(wavs, cleaned_wavs)))
+
+        # Now concat cleaned chapter wavs -> cleaned_wav (combined cleaned)
+        cleaned_wav = os.path.join(tmp, "cleaned.wav")
+        listfile = os.path.join(tmp, "wav_concat.txt")
+        with open(listfile, "w", encoding="utf-8") as f:
+            for cw in cleaned_wavs:
+                safe = cw.replace("\\", "\\\\").replace("'", r"'\''")
+                f.write(f"file '{safe}'\n")
+
+        import subprocess
+        subprocess.run(
+            ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", listfile, "-c", "copy", cleaned_wav],
+            check=True, capture_output=True, timeout=300,
+        )
 
         # Loudnorm two-pass
         normalized_wav = os.path.join(tmp, "normalized.wav")
