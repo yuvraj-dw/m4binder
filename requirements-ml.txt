@@ -1,5 +1,7 @@
-deepfilternet==0.5.6
-soundfile==0.13.1
-torch==2.6.0
-torchaudio==2.6.0
-# For CPU-only, use: pip install torch==2.6.0+cpu torchaudio==2.6.0+cpu --extra-index-url https://download.pytorch.org/whl/cpu
+# Legacy torch-based ML removed in v2.0 — now Rust deep-filter binary only (35M, auto-installed)
+# No pip deps needed for best pipeline (ml-rust 12dB), only system ffmpeg + auto-installed deep-filter binary
+# For legacy torch path (deprecated):
+# deepfilternet==0.5.6
+# soundfile==0.13.1
+# torch==2.6.0
+# torchaudio==2.6.0

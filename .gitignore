@@ -17,7 +17,7 @@ build/
 .coverage
 htmlcov/
 
-# Audio outputs - prevent accidental commit
+# Audio outputs - prevent accidental commit + test artifacts
 *.m4b
 *.orig.m4b
 *.orig.*.m4b
@@ -26,6 +26,15 @@ htmlcov/
 *.cover.jpg
 *.concat.txt
 *.ffmetadata
+*.log
+before_after/
+.pytest_cache/
+auto_sample/
+cross/
+ml_rust_knobs/
+originals_rust_vs_torch/
+run_*.sh
+move_music.sh
 
 # OS
 .DS_Store
