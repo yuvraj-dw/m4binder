@@ -144,3 +144,39 @@ def test_cover_format_png_is_honoured(m4b, tmp_path):
     from mutagen.mp4 import MP4, MP4Cover
     write_m4b_tags(m4b, {"title": "T"}, cover=_jpeg(tmp_path), cover_format="png")
     assert MP4(m4b)["covr"][0].imageformat == MP4Cover.FORMAT_PNG
+
+
+def test_non_list_atoms_do_not_crash_the_reader(m4b):
+    """`cpil`/`pgap` are bare bools and `trkn`/`disk` are tuples, not lists.
+
+    Indexing [0] unconditionally raises "'bool' object is not subscriptable" on
+    any file carrying one -- and every Libation rip carries them. That made 90%
+    of an 1,800-book library look unreadable, and the failure presented as
+    corrupt files rather than as a reader bug, which is the expensive kind.
+
+    Reverting read_m4b_tags to `value[0]` turns this red.
+    """
+    from mutagen.mp4 import MP4
+
+    audio = MP4(m4b)
+    audio["cpil"] = True          # compilation: a bare bool
+    audio["pgap"] = False         # gapless: a bare bool
+    audio["trkn"] = [(3, 12)]     # track number: a tuple inside a list
+    audio.save()
+
+    tags = read_m4b_tags(m4b)     # must not raise
+    assert tags["cpil"] is True
+    assert tags["pgap"] is False
+    assert tags["trkn"] == (3, 12)
+
+
+def test_an_empty_atom_list_reads_as_none_rather_than_raising(m4b):
+    """A present-but-empty atom is malformed, not fatal. IndexError here would
+    take out the whole read for one bad key."""
+    from mutagen.mp4 import MP4
+
+    audio = MP4(m4b)
+    audio["\xa9nam"] = []
+    audio.save()
+
+    assert read_m4b_tags(m4b).get("title") is None

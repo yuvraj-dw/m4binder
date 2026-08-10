@@ -128,5 +128,14 @@ def read_m4b_tags(path: Path | str) -> dict:
                            if isinstance(value[0], bytes) else str(value[0]))
             continue
         name = reverse.get(atom, atom)
-        out[name] = value[0] if not isinstance(value, list) or len(value) != 1 else value[0]
+        # Not every MP4 atom is a list. `cpil` (compilation) and `pgap` are
+        # plain bools, and `trkn`/`disk` are tuples, so indexing [0]
+        # unconditionally raises "'bool' object is not subscriptable" on any
+        # file that carries one. Every Libation rip does: this made 90% of a
+        # 1,800-book library look unreadable, and the failure LOOKED like
+        # corrupt files rather than a reader bug.
+        if isinstance(value, list):
+            out[name] = value[0] if value else None
+        else:
+            out[name] = value
     return out
