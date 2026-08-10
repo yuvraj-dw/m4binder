@@ -3,7 +3,7 @@
 
 Subcommands:
   bind   Convert mp3 chapter folders into m4b files (single or multiple mode).
-  clean  Restore/clean an existing m4b file (basic DSP or ML).
+  clean  Restore/clean an existing m4b file with DeepFilterNet3.
   tag    Write tags and cover art onto an existing m4b, without re-encoding.
 """
 import argparse

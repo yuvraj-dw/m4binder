@@ -1,5 +1,11 @@
 # m4binder + audio cleanup — Plan Doc
 
+> **HISTORICAL, 2026-05-14. Do not use as a description of what ships.**
+> It plans a two-mode `clean` (`basic` sox / `ml` DeepFilterNet3); only the ML
+> path shipped, the sox mode was dropped, and `--backend` replaced the
+> mode flag. README.md is authoritative. Kept because its risk analysis is
+> still the clearest record of why several defaults are what they are.
+
 Generated 2026-05-14 after 4 adversarial reviews + TDD (25 tests passing). Working tree dirty vs HEAD (`feat/cleanup-merge`).
 
 ## 1. Executive Summary

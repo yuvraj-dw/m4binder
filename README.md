@@ -8,6 +8,12 @@ Cleaning runs [DeepFilterNet3](https://github.com/Rikorose/DeepFilterNet) over
 the whole book, then normalises loudness to broadcast targets. On a 24-core
 machine a 2.9-hour audiobook cleans in about 8 minutes.
 
+> **`F-nn` below refers to the findings register in
+> [m4binder-research](https://github.com/patricker/m4binder-research/blob/main/docs/findings.md)**, where the
+> model-training and listening work lives. Claims here are cited rather than
+> restated, including the ones later retracted. Nothing in that repo is needed to
+> build or run this one.
+
 ## Install
 
 ```bash
@@ -110,7 +116,7 @@ loudness are memory-bandwidth-bound and saturate around 8-12 workers, and pushin
 to 24 made each worker 3x slower for only 26% more aggregate throughput.
 
 **The later, properly-repeated benchmark does not reproduce that 26%.** On
-`before_after/bench2060` (3 runs each, 300 s of audio, same box) the aggregate DF3
+a repeated benchmark (3 runs each, 300 s of audio, same box; artifacts in m4binder-research) the aggregate DF3
 speedups were w1 6.9x, w4 25.4x, **w8 42.6x, w12 38.3x, w24 42.0x** — 8 → 24 is
 −1.5%, and the shipped default of 12 is nominally the *worst* of {8, 12, 24}. The
 run-to-run spread at w24 is 32-67x, i.e. wider than the differences between
@@ -252,7 +258,7 @@ unverified for most of this project's life. Re-measured 2026-08-07 at the
 shipped default (`--jobs-encode 1`, one stream part): **encode + mux runs at
 62.6x**, encode alone at 64.7x, and a monolithic ffmpeg call at 66.8x — so there
 is no per-part overhead worth removing (F-52,
-`before_after/encode_bench/results.json`). **52x is pessimistic by ~20%**, which
+artifacts in m4binder-research). **52x is pessimistic by ~20%**, which
 means every library estimate on this page overstates the encode wall rather than
 understating it. The 4.0-minute enhance row may still have been taken on a
 CUDA-visible box, in which case it was a GPU measurement mislabelled as CPU
@@ -294,7 +300,7 @@ generation regardless of whether it needs cleaning.
 **Do not use `--atten-lim auto`. Use the default of 12.** Its range is also wider
 than this README used to say — the Options table claimed "10-17 typical", but the
 estimator clamps to **6-30** and measured 6/11/30 (min/median/max) over 60 books;
-running it over the 10 books in `before_after/auto_sample/` gives 7, 10, 10, 10,
+running it over 10 books (m4binder-research, `auto_sample`) gives 7, 10, 10, 10,
 14, 15, 17, 19, 20, 27. Four of ten sit outside "10-17", and the top of the range
 is where it sounds worst.
 

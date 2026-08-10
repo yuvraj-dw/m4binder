@@ -421,7 +421,7 @@ def estimate_optimal_atten_lim(m4b_path: str, margin_db: float = 3.0,
     the residual SNR the cleanup aims for, not a measured property of the file.
     51 dB is an anchor, not a measurement: a median library book measures ~42 dB
     of gap SNR, and 42 -> 12 dB reproduces the listening-validated default (see
-    docs/ML_CLEANUP_DESIGN.md). It has not itself been validated by listening.
+    m4binder-research). It has not itself been validated by listening.
 
     Clamped to 6-30 dB for audiobooks (6=no NR, 30=keeps room tone, 100=full would be overkill per user test).
     """
