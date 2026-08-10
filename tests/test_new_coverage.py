@@ -58,22 +58,24 @@ def test_iter_targets_broken_symlink(tmp_path):
         list(iter_targets(str(link), "*.m4b"))
 
 
+@pytest.mark.ml
 def test_keep_original_versioning(fixture_m4b, tmp_path):
     work = tmp_path / "work.m4b"
     shutil.copy(fixture_m4b, work)
 
     # First clean with keep_original — should create .orig.m4b
-    clean_one(str(work), mode="basic", keep_original=True, skip_threshold_db=-100.0)
+    clean_one(str(work), keep_original=True, workers={"df3": 1, "loudness": 1, "encode": 1})
     orig = tmp_path / "work.orig.m4b"
     assert orig.exists()
 
     # Second clean with keep_original — should create .orig.1.m4b not overwrite
-    clean_one(str(work), mode="basic", keep_original=True, skip_threshold_db=-100.0)
+    clean_one(str(work), keep_original=True, workers={"df3": 1, "loudness": 1, "encode": 1})
     orig1 = tmp_path / "work.orig.1.m4b"
     assert orig1.exists()
     assert orig.exists()  # original backup still there
 
 
+@pytest.mark.ml
 def test_cleanup_preserves_chapters_and_cover(tmp_path, fixtures_dir):
     # Build an m4b with 2 chapters and a cover via ffmpeg
     # Create a cover jpg via lavfi color
@@ -125,7 +127,7 @@ def test_cleanup_preserves_chapters_and_cover(tmp_path, fixtures_dir):
     assert "[CHAPTER]" in chap_before.read_text()
 
     # Now clean it
-    clean_one(str(out_m4b), mode="basic", keep_original=False, skip_threshold_db=-100.0)
+    clean_one(str(out_m4b), keep_original=False, workers={"df3": 1, "loudness": 1, "encode": 1})
 
     # After clean, chapters and cover should still exist
     after_cover = ffmpeg_utils.extract_cover(str(out_m4b))
@@ -134,37 +136,6 @@ def test_cleanup_preserves_chapters_and_cover(tmp_path, fixtures_dir):
     ffmpeg_utils.extract_chapters(str(out_m4b), str(chap_after))
     content = chap_after.read_text()
     assert "[CHAPTER]" in content, "chapters should be preserved through clean"
-
-
-def test_sox_pipeline_with_silence_window(tmp_path):
-    # Create wav with silence gap: tone 1s + silence 1.5s + tone 1s => 3.5s
-    wav = tmp_path / "with_silence.wav"
-    subprocess.run(
-        [
-            "ffmpeg", "-y",
-            "-f", "lavfi", "-i", "sine=frequency=440:duration=1",
-            "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100:duration=1.5",
-            "-f", "lavfi", "-i", "sine=frequency=880:duration=1",
-            "-filter_complex", "[0:a][1:a][2:a]concat=n=3:v=0:a=1",
-            "-c:a", "pcm_s16le", str(wav),
-        ],
-        check=True, capture_output=True,
-    )
-    assert wav.exists()
-
-    from m4b_lib.cleanup import _find_silence_window, _sox_pipeline
-
-    win = _find_silence_window(str(wav))
-    assert win is not None, "should find silence window in crafted file"
-    start, end = win
-    assert end - start >= 1.0
-
-    out_wav = tmp_path / "cleaned.wav"
-    # tmpdir for noise files
-    _sox_pipeline(str(wav), str(out_wav), str(tmp_path))
-    assert out_wav.exists()
-    dur = ffmpeg_utils.get_duration(str(out_wav))
-    assert abs(dur - 3.5) < 0.5
 
 
 def test_bind_apostrophe_escaping(tmp_path, fixtures_dir):

@@ -17,6 +17,16 @@ build/
 .coverage
 htmlcov/
 
+# Model artifacts. There was no rule for these until 2026-08-10; the repo got
+# away with it only because the checkpoints lived on another machine.
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.safetensors
+*.npz
+*.npy
+
 # Audio outputs - prevent accidental commit + test artifacts
 *.m4b
 *.orig.m4b
@@ -39,3 +49,6 @@ move_music.sh
 # OS
 .DS_Store
 Thumbs.db
+
+# firecrawl scratch
+.firecrawl/

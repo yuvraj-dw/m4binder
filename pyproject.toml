@@ -11,9 +11,13 @@ requires-python = ">=3.11,<3.13"
 dependencies = [
     "mutagen==1.47.0",
     "requests==2.32.3",
+    "numpy",
     "openlibrary-client @ git+https://github.com/internetarchive/openlibrary-client.git@3f131881358d2c0dba5de79d894b80fae24742c6",
 ]
 
+# NOTE: the `ml` extra pins torch 2.6.0, which is correct for CPU inference and
+# for the RTX 2060 deployment card. Model *training* has different and
+# incompatible requirements and lives in m4binder-research, not here.
 [project.optional-dependencies]
 ml = [
     "deepfilternet==0.5.6",
@@ -21,13 +25,6 @@ ml = [
     "torch==2.6.0",
     "torchaudio==2.6.0",
 ]
-ml-legacy = [
-    "deepfilternet==0.5.6",
-    "soundfile==0.13.1",
-    "torch==2.6.0",
-    "torchaudio==2.6.0",
-]
-ml-rust = []  # Rust binary only, no pip deps, auto-installed
 dev = [
     "pytest==9.0.3",
 ]
@@ -37,4 +34,7 @@ testpaths = ["tests"]
 addopts = "-v"
 markers = [
     "ml: marks tests as requiring ML deps (torch, deepfilternet)",
+]
+filterwarnings = [
+    "ignore:`torchaudio.backend.common.AudioMetaData` has been moved to `torchaudio.AudioMetaData`.*:UserWarning:df.io",
 ]

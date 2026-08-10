@@ -10,12 +10,9 @@ For v2.0 single best set: ml-rust 12dB is default, no fallback.
 """
 
 import os
-import tempfile
 from typing import List
 
-from m4b_lib import ffmpeg_utils, metadata
 from m4b_lib.bind import BindOptions, _natural_key
-from m4b_lib.cleanup import _decode_to_wav, _loudness_normalize, _sox_pipeline_v2, _afftdn_pipeline, _hybrid_pipeline
 
 
 def _list_mp3s(folder: str) -> List[str]:
@@ -28,141 +25,44 @@ def _list_mp3s(folder: str) -> List[str]:
 def _bind_and_clean_one(input_folder: str, output_m4b: str, bind_opts: BindOptions,
                         clean_atten_lim: str = "12", clean_pf: bool = False,
                         keep_original: bool = False) -> None:
-    """One-step: mp3 folder -> cleaned m4b, single lossy encode.
+    import os
+    import shutil
+    import tempfile
 
-    Steps:
-    1. List mp3s natural sort
-    2. Resolve metadata (title/author/cover)
-    3. Parallel decode mp3s -> wavs (1ch 48k for ml-rust best)
-    4. Concat wavs -> combined.wav
-    5. Create chapters ffmetadata from mp3 durations
-    6. Clean combined.wav via ml-rust best (12dB) -> cleaned.wav
-    7. Loudnorm two-pass -19/-2/7 mono -> normalized.wav
-    8. Embed chapters+cover+normalized -> final m4b atomic
+    from m4b_lib import ffmpeg_utils, metadata, timeline
+    from m4b_lib.cleanup import _validate_output, clean_timeline
 
-    If keep_original True and output exists, preserves original as .orig.m4b (not applicable for migrate first time).
-    """
     mp3s = _list_mp3s(input_folder)
     if not mp3s:
         raise ValueError(f"No mp3 files in {input_folder}")
+    meta = metadata.resolve_metadata(bind_opts.metadata_source, bind_opts.title,
+                                     bind_opts.author, first_mp3=mp3s[0])
 
-    meta = metadata.resolve_metadata(
-        bind_opts.metadata_source, bind_opts.title, bind_opts.author, first_mp3=mp3s[0]
-    )
+    parent = os.path.dirname(os.path.abspath(output_m4b))
+    os.makedirs(parent, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="m4b_migrate_", dir=parent) as tmp:
+        tl = timeline.from_mp3s(mp3s, tmp, title=meta.title, author=meta.author,
+                                cover_bytes=meta.cover_bytes)
+        staged = os.path.join(tmp, "cleaned.m4b")
+        # No separate uncleaned m4b to probe here — mp3s are the source, so
+        # "auto" estimates SNR from the concatenated wav the timeline just
+        # built (same estimator `clean --atten-lim auto` uses on a source m4b).
+        atten = ffmpeg_utils.resolve_atten_lim(clean_atten_lim, tl.wav_path)
+        clean_timeline(tl, staged, atten_lim_db=atten, pf=clean_pf,
+                       bitrate=bind_opts.bitrate)
+        # No source m4b to probe here — mp3s are the source, so tl.duration
+        # (from the decoded/concatenated wav) is the correct reference.
+        _validate_output(staged, tl.duration)
 
-    # Use same FS as output for atomic replace safety
-    output_parent = os.path.dirname(os.path.abspath(output_m4b))
-    os.makedirs(output_parent, exist_ok=True)
-
-    with tempfile.TemporaryDirectory(prefix="m4b_migrate_", dir=output_parent) as tmp:
-        wav_dir = os.path.join(tmp, "wavs")
-        os.makedirs(wav_dir, exist_ok=True)
-
-        # Parallel decode mp3s -> wavs, 1ch 48k for ml-rust best
-        wavs = []
-        for mp3 in mp3s:
-            base = os.path.splitext(os.path.basename(mp3))[0]
-            wav_path = os.path.join(wav_dir, base + ".wav")
-            _decode_to_wav(mp3, wav_path, channels=1, sample_rate=48000)
-            wavs.append(wav_path)
-
-        # Chapters from mp3 durations (for final embed)
-        chapters_ini = os.path.join(tmp, "chapters.ini")
-        ffmpeg_utils.create_chapters_ffmetadata(mp3s, chapters_ini)
-
-        # For inbound MP3->M4B with cleaning: process chapters for cleaning in parallel, THEN merge
-        # This is optimal single lossy: each chapter wav cleaned in parallel, then concat cleaned
-        print(f"  cleaning {len(wavs)} chapter wavs in parallel (mp3->cleaned wavs, not combined yet)")
-
-        # Determine atten-lim
-        try:
-            atten = clean_atten_lim
-            if isinstance(atten, str) and atten.lower() == "auto":
-                # For auto, estimate from first chapter or combined? Use first for speed, or combined for accuracy
-                # Use first wav for quick estimate
-                optimal, info = ffmpeg_utils.estimate_optimal_atten_lim(wavs[0])
-                if optimal is not None:
-                    print(f"  [auto] SNR {info.get('snr'):.1f}dB -> atten-lim {optimal}dB")
-                    atten = optimal
-                else:
-                    atten = 12.0
-            else:
-                atten = float(atten)
-        except:
-            atten = 12.0
-
-        # Parallel clean each chapter wav -> cleaned chapter wav
-        cleaned_wavs = []
-        for wav_path in wavs:
-            base = os.path.splitext(os.path.basename(wav_path))[0]
-            cleaned_path = os.path.join(wav_dir, base + "_cleaned.wav")
-            cleaned_wavs.append(cleaned_path)
-
-        def _clean_one_chapter(args):
-            wav_in, wav_out = args
-            try:
-                from m4b_lib.cleanup_ml_rust import _find_binary, rust_enhance
-                binary = _find_binary()
-                if binary is None:
-                    raise FileNotFoundError("deep-filter binary not found")
-                rust_enhance(wav_in, wav_out, atten_lim_db=atten, pf=clean_pf)
-                return wav_out
-            except Exception as e:
-                print(f"  Rust failed for {wav_in} ({e}), fallback afftdn")
-                _afftdn_pipeline(wav_in, wav_out)
-                return wav_out
-
-        from concurrent.futures import ThreadPoolExecutor
-        # Use ThreadPool for CPU-bound deep-filter (Rust binary is external process, so threadpool okay)
-        # For 30h book with 49 chapters avg 37min, 8 jobs = ~4x speedup
-        with ThreadPoolExecutor(max_workers=min(8, len(wavs))) as ex:
-            list(ex.map(_clean_one_chapter, zip(wavs, cleaned_wavs)))
-
-        # Now concat cleaned chapter wavs -> cleaned_wav (combined cleaned)
-        cleaned_wav = os.path.join(tmp, "cleaned.wav")
-        listfile = os.path.join(tmp, "wav_concat.txt")
-        with open(listfile, "w", encoding="utf-8") as f:
-            for cw in cleaned_wavs:
-                safe = cw.replace("\\", "\\\\").replace("'", r"'\''")
-                f.write(f"file '{safe}'\n")
-
-        import subprocess
-        subprocess.run(
-            ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", listfile, "-c", "copy", cleaned_wav],
-            check=True, capture_output=True, timeout=300,
-        )
-
-        # Loudnorm two-pass
-        normalized_wav = os.path.join(tmp, "normalized.wav")
-        _loudness_normalize(cleaned_wav, normalized_wav, channels=1)
-
-        # Embed to final m4b
-        cleaned_m4b_tmp = os.path.join(tmp, "cleaned.m4b")
-        ffmpeg_utils.embed_chapters_and_meta(
-            normalized_wav, chapters_ini=chapters_ini, cover_bytes=meta.cover_bytes,
-            output_m4b=cleaned_m4b_tmp, tmpdir=tmp, copy_audio=False,
-            title=meta.title, author=meta.author, bitrate=bind_opts.bitrate,
-        )
-
-        # Validate and atomic replace
-        if not os.path.exists(cleaned_m4b_tmp) or os.path.getsize(cleaned_m4b_tmp) < 1024:
-            raise RuntimeError(f"migrate produced invalid output size {os.path.getsize(cleaned_m4b_tmp) if os.path.exists(cleaned_m4b_tmp) else 'missing'}")
-
-        # Handle keep_original if output exists and requested
         if keep_original and os.path.exists(output_m4b):
-            import shutil
             backup = os.path.splitext(output_m4b)[0] + ".orig.m4b"
-            if os.path.exists(backup):
-                base, ext = os.path.splitext(backup)
-                i = 1
-                while os.path.exists(f"{base}.{i}{ext}"):
-                    i += 1
+            base, ext = os.path.splitext(backup)
+            i = 1
+            while os.path.exists(backup):
                 backup = f"{base}.{i}{ext}"
+                i += 1
             shutil.copy2(output_m4b, backup)
-            print(f"  original kept at {backup}")
-
-        os.replace(cleaned_m4b_tmp, output_m4b)
-
+        os.replace(staged, output_m4b)
     print(f"Created cleaned audiobook: {output_m4b}")
 
 

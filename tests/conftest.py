@@ -1,6 +1,21 @@
 """Pytest fixtures: synthesize tiny audio files via ffmpeg lavfi at session start."""
 import subprocess
+import importlib.util
 import pytest
+
+
+def _ml_available() -> bool:
+    return all(importlib.util.find_spec(m) is not None for m in ("torch", "df", "soundfile"))
+
+
+def pytest_collection_modifyitems(config, items):
+    """Skip @pytest.mark.ml tests when the ml extra isn't installed."""
+    if _ml_available():
+        return
+    skip = pytest.mark.skip(reason="ML extra not installed (pip install -e '.[ml]')")
+    for item in items:
+        if "ml" in item.keywords:
+            item.add_marker(skip)
 
 
 @pytest.fixture(scope="session")
@@ -39,6 +54,26 @@ def fixture_m4b(fixtures_dir, tmp_path_factory):
             "ffmpeg", "-y", "-f", "concat", "-safe", "0",
             "-i", str(listfile),
             "-c:a", "aac", "-b:a", "64k", str(out),
+        ],
+        check=True, capture_output=True,
+    )
+    return out
+
+
+@pytest.fixture(scope="session")
+def noisy_wav_48k(tmp_path_factory):
+    """8s of mono 48k speech-ish tone plus white noise, as float wav.
+
+    Long enough to exercise two 3s chunks with 1s overlap in stream tests.
+    """
+    out = tmp_path_factory.mktemp("wav") / "noisy.wav"
+    subprocess.run(
+        [
+            "ffmpeg", "-y",
+            "-f", "lavfi", "-i", "sine=frequency=220:duration=8:sample_rate=48000",
+            "-f", "lavfi", "-i", "anoisesrc=duration=8:sample_rate=48000:amplitude=0.05",
+            "-filter_complex", "[0:a][1:a]amix=inputs=2:duration=shortest",
+            "-ac", "1", "-ar", "48000", "-c:a", "pcm_s16le", str(out),
         ],
         check=True, capture_output=True,
     )

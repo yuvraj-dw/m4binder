@@ -1,9 +1,27 @@
 """ffmpeg/ffprobe subprocess wrappers + chapter and noise-floor helpers."""
+import json
 import os
 import re
 import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Iterable, Optional
+
+
+def duration_timeout(audio_seconds: Optional[float], minimum: float = 300.0,
+                      factor: float = 0.25) -> float:
+    """Wall-clock bound for an ffmpeg call over `audio_seconds` of audio.
+
+    This is hang detection, not a performance budget, so the bound must stay
+    far looser than measured throughput while still catching a real hang in
+    bounded time. factor=0.25 gives ~11x margin over the measured single-worker
+    loudnorm baseline (0.25D vs. D/45) and ~3.75x even against a hypothetical
+    3x-worse-than-baseline contention scenario — false positives stay
+    implausible — while capping the undetected-hang window at a quarter of the
+    book's length instead of the full length a factor of 1.0 would allow.
+    """
+    if not audio_seconds or audio_seconds <= 0:
+        return minimum
+    return max(minimum, audio_seconds * factor)
 
 
 def get_duration(file_path: str) -> Optional[float]:
@@ -15,7 +33,7 @@ def get_duration(file_path: str) -> Optional[float]:
             "-of", "default=noprint_wrappers=1:nokey=1",
             file_path,
         ],
-        capture_output=True, text=True, timeout=30,
+        capture_output=True, text=True, errors="replace", timeout=30,
     )
     if r.returncode != 0:
         return None
@@ -136,8 +154,17 @@ def parallel_transcode(mp3_files: Iterable[str], output_dir: str, bitrate: str =
     return paths
 
 
-def concat_audio_to_m4b(audio_files: list[str], output_m4b: str) -> None:
-    """Concatenate ordered audio files into a single m4b via ffmpeg concat demuxer."""
+def concat_audio_to_m4b(audio_files: list[str], output_m4b: str, mp3_passthrough: bool = False) -> None:
+    """Concatenate ordered audio files into a single m4b via ffmpeg concat demuxer.
+
+    mp3_passthrough=True is for bind's audio_mode="copy": ffmpeg's extension-
+    inferred "ipod" muxer refuses to mux an mp3 stream ("Could not find tag
+    for codec mp3 in stream"), so this pins the muxer to plain mp4 (which
+    accepts mp3 and aac alike) and pins the brand back to M4A, since mp4's
+    own default brand is the generic "isom" rather than the M4A/M4B identity
+    players use to recognize audiobook-shaped files. Every other (existing)
+    caller leaves the muxer selection untouched.
+    """
     if not audio_files:
         raise ValueError("concat_audio_to_m4b: no input files")
     import tempfile
@@ -153,14 +180,15 @@ def concat_audio_to_m4b(audio_files: list[str], output_m4b: str) -> None:
                     raise ValueError(f"concat list does not support newline in path: {p!r}")
                 safe_p = p.replace("\\", "\\\\").replace("'", r"'\''")
                 f.write(f"file '{safe_p}'\n")
-        subprocess.run(
-            [
-                "ffmpeg", "-y", "-f", "concat", "-safe", "0",
-                "-i", listfile,
-                "-c", "copy", output_m4b,
-            ],
-            check=True, capture_output=True, timeout=300,
-        )
+        cmd = [
+            "ffmpeg", "-y", "-f", "concat", "-safe", "0",
+            "-i", listfile,
+            "-c", "copy",
+        ]
+        if mp3_passthrough:
+            cmd += ["-f", "mp4", "-brand", "M4A "]
+        cmd += [output_m4b]
+        subprocess.run(cmd, check=True, capture_output=True, timeout=300)
     finally:
         try:
             os.unlink(listfile)
@@ -183,6 +211,7 @@ def embed_chapters_and_meta(
     audio_in: str, chapters_ini: Optional[str], cover_bytes: Optional[bytes],
     output_m4b: str, title: str = "", author: str = "", bitrate: str = "64k",
     tmpdir: Optional[str] = None, copy_audio: bool = False,
+    mp3_passthrough: bool = False,
 ) -> None:
     """Re-encode audio_in to m4b, attaching chapters from ffmetadata file + optional cover.
 
@@ -192,6 +221,12 @@ def embed_chapters_and_meta(
 
     If copy_audio is True, the audio stream is copied without re-encoding
     (used by bind to avoid double lossy transcode). Otherwise re-encodes to aac.
+
+    mp3_passthrough=True is for bind's audio_mode="copy": same "ipod" muxer
+    problem and same fix as concat_audio_to_m4b (see its docstring) -- pin
+    the muxer to mp4 and the brand back to M4A only when an mp3 stream is
+    actually being copied through. Every other (existing) caller is
+    unaffected: the muxer is left to ffmpeg's own extension inference.
     """
     import tempfile
     # Ensure final_dir exists before any mkstemp that may use it
@@ -248,13 +283,16 @@ def embed_chapters_and_meta(
     else:
         cmd += ["-c:a", "aac", "-b:a", bitrate]
 
+    if mp3_passthrough:
+        cmd += ["-f", "mp4", "-brand", "M4A "]
+
     # H1 fix: write to temp file in same dir as final output, then atomic replace
     fd, tmp_output = tempfile.mkstemp(suffix=".tmp.m4b", dir=final_dir)
     os.close(fd)
 
     cmd += ["-movflags", "faststart", tmp_output]
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        result = subprocess.run(cmd, capture_output=True, text=True, errors="replace", timeout=600)
         if result.returncode != 0:
             raise subprocess.CalledProcessError(
                 result.returncode, cmd, output=result.stdout, stderr=result.stderr
@@ -287,20 +325,42 @@ def embed_chapters_and_meta(
 
 
 def probe_noise_floor(audio_path: str) -> Optional[float]:
-    """Estimate mean volume (dBFS) using ffmpeg volumedetect on whole file (or up to 60s for speed).
+    """Estimate mean volume (dBFS) using ffmpeg volumedetect.
+
+    For files >1h, samples 60s from middle (1800s offset) to avoid 36min scan
+    for 30h books (was timeout 120s killing Wizard). Falls back to whole file.
 
     Returns mean_volume in dB, or None if undetectable.
     For n/a / -inf (digital silence) returns -91.0 dB (very quiet).
     Higher (less negative) = louder. Used by cleanup pre-flight to skip
-    already-quiet inputs. Probes whole file for accuracy (fast, no encode).
+    already-quiet inputs.
     """
-    r = subprocess.run(
-        [
+    # For long files >1h, sample 60s from middle for speed (avoid whole-file scan)
+    dur = get_duration(audio_path)
+    if dur is not None and dur > 3600:
+        # Sample 60s from 30min or middle-30s for representation
+        ss = min(1800, max(0, dur / 2 - 30))
+        cmd = [
+            "ffmpeg", "-ss", str(ss), "-t", "60", "-i", audio_path,
+            "-af", "volumedetect", "-vn", "-f", "null", "-",
+        ]
+        timeout = 60
+    else:
+        cmd = [
             "ffmpeg", "-i", audio_path,
             "-af", "volumedetect", "-vn", "-f", "null", "-",
-        ],
-        capture_output=True, text=True, timeout=120,
-    )
+        ]
+        timeout = 600  # increased from 120 to handle 30h if we do whole file
+
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, errors="replace", timeout=timeout)
+    except subprocess.TimeoutExpired:
+        # Fallback to 60s sample on timeout
+        r = subprocess.run(
+            ["ffmpeg", "-ss", "1800", "-t", "60", "-i", audio_path,
+             "-af", "volumedetect", "-vn", "-f", "null", "-"],
+            capture_output=True, text=True, errors="replace", timeout=60,
+        )
     # ffmpeg can output "mean_volume: n/a" or "mean_volume: -inf dB" or numeric.
     # Handle cases with and without dB suffix, scientific notation like -1.2e-05
     m = re.search(r"mean_volume:\s*(-?\d+(?:\.\d+)?(?:e[+-]?\d+)?|-\s*inf|n/a)\s*(?:dB)?", r.stderr, re.IGNORECASE)
@@ -322,7 +382,7 @@ def _find_silence_windows_for_atten(wav_path: str, thresholds: list[int] = [-40,
     for db in thresholds:
         r = subprocess.run(
             ["ffmpeg", "-i", wav_path, "-af", f"silencedetect=noise={db}dB:d={min_dur}", "-f", "null", "-"],
-            capture_output=True, text=True, timeout=120,
+            capture_output=True, text=True, errors="replace", timeout=120,
         )
         starts = re.findall(r"silence_start:\s*([\d.]+)", r.stderr)
         ends = re.findall(r"silence_end:\s*([\d.]+)", r.stderr)
@@ -347,11 +407,22 @@ def _find_silence_windows_for_atten(wav_path: str, thresholds: list[int] = [-40,
     return filtered
 
 
-def estimate_optimal_atten_lim(m4b_path: str, margin_db: float = 3.0) -> tuple[Optional[float], dict]:
+def estimate_optimal_atten_lim(m4b_path: str, margin_db: float = 3.0,
+                               target_snr_db: float = 51.0) -> tuple[Optional[float], dict]:
     """Estimate optimal attenuation limit for deep-filter based on SNR of silence vs speech.
 
     Returns (optimal_atten_db, info_dict) where info contains noise_max, overall, snr, windows.
     Uses max (least quiet) silence window as representative hiss, not average of deepest silence.
+
+    The measured SNR is programme level minus the worst silence-window noise
+    floor. The attenuation limit is the shortfall against `target_snr_db` plus
+    `margin_db` of headroom, so a NOISIER file (low SNR) gets a LARGER limit and
+    a clean file gets a small one. `target_snr_db` is the calibration knob: it is
+    the residual SNR the cleanup aims for, not a measured property of the file.
+    51 dB is an anchor, not a measurement: a median library book measures ~42 dB
+    of gap SNR, and 42 -> 12 dB reproduces the listening-validated default (see
+    docs/ML_CLEANUP_DESIGN.md). It has not itself been validated by listening.
+
     Clamped to 6-30 dB for audiobooks (6=no NR, 30=keeps room tone, 100=full would be overkill per user test).
     """
     import tempfile
@@ -359,10 +430,20 @@ def estimate_optimal_atten_lim(m4b_path: str, margin_db: float = 3.0) -> tuple[O
 
     with tempfile.TemporaryDirectory(prefix="atten_est_") as tmp:
         wav = os.path.join(tmp, "tmp.wav")
-        r = subprocess.run(
-            ["ffmpeg", "-y", "-i", m4b_path, "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", wav],
-            capture_output=True, text=True, timeout=120,
-        )
+        # Sample 60s from 30min offset for speed (was whole file 30h = 2.4h scan)
+        # Use get_duration to compute offset, fallback to 1800s
+        dur_full = get_duration(m4b_path)
+        if dur_full and dur_full > 1800:
+            ss_off = min(1800, dur_full / 2)
+            r = subprocess.run(
+                ["ffmpeg", "-y", "-ss", str(ss_off), "-t", "60", "-i", m4b_path, "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", wav],
+                capture_output=True, text=True, errors="replace", timeout=60,
+            )
+        else:
+            r = subprocess.run(
+                ["ffmpeg", "-y", "-i", m4b_path, "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", wav],
+                capture_output=True, text=True, errors="replace", timeout=120,
+            )
         if not os.path.exists(wav):
             return None, info
 
@@ -374,10 +455,15 @@ def estimate_optimal_atten_lim(m4b_path: str, margin_db: float = 3.0) -> tuple[O
 
         noise_vals = []
         for s, e in windows[:3]:
-            dur = e - s
+            # atrim, not -ss/-t: an output -t stops the muxer, not the filter, so
+            # volumedetect kept measuring a frame or more past the end of the
+            # silence window and averaged in the speech that follows it. On a
+            # quiet gap that swamps the reading (measured -33 dB where the gap
+            # was -88 dB), which flattened every SNR to the same value.
             r = subprocess.run(
-                ["ffmpeg", "-ss", str(s), "-i", wav, "-t", str(dur), "-af", "volumedetect", "-vn", "-f", "null", "-"],
-                capture_output=True, text=True, timeout=30,
+                ["ffmpeg", "-i", wav, "-af", f"atrim=start={s}:end={e},volumedetect",
+                 "-vn", "-f", "null", "-"],
+                capture_output=True, text=True, errors="replace", timeout=30,
             )
             m = re.search(r"mean_volume:\s*(-?\d+(?:\.\d+)?)", r.stderr)
             if m:
@@ -398,7 +484,7 @@ def estimate_optimal_atten_lim(m4b_path: str, margin_db: float = 3.0) -> tuple[O
         if overall is None:
             r = subprocess.run(
                 ["ffmpeg", "-i", wav, "-af", "volumedetect", "-vn", "-f", "null", "-"],
-                capture_output=True, text=True, timeout=60,
+                capture_output=True, text=True, errors="replace", timeout=60,
             )
             m = re.search(r"mean_volume:\s*(-?\d+(?:\.\d+)?)", r.stderr)
             if m:
@@ -411,9 +497,39 @@ def estimate_optimal_atten_lim(m4b_path: str, margin_db: float = 3.0) -> tuple[O
 
         snr = overall - noise_max
         info["snr"] = snr
-        optimal = max(6.0, min(30.0, round(snr + margin_db)))
+        # Attenuation needed = how far short of the target SNR this file falls.
+        # (It used to be `snr + margin_db`, which ranked files backwards: a clean
+        # file with a 40 dB SNR asked for the most aggressive setting and a noisy
+        # one with a 5 dB SNR asked for the mildest.)
+        optimal = max(6.0, min(30.0, round(target_snr_db - snr + margin_db)))
         info["optimal"] = optimal
         return optimal, info
+
+
+def resolve_atten_lim(spec: str, probe_path: str) -> float:
+    """Resolve a CLI atten-lim spec ("12", "auto", ...) to a float dB value.
+
+    Shared by `clean` (probes the source m4b) and `migrate`/`bind --clean`
+    (probes the concatenated wav the timeline builds, since there's no
+    separate uncleaned m4b when the source is mp3 chapters) — one place for
+    the estimate/fallback/print logic instead of two copies drifting apart.
+
+    "auto" estimates from probe_path via estimate_optimal_atten_lim (SNR-based),
+    printing what it chose and why, and falls back to 12.0 if estimation
+    can't produce a value (e.g. an unreadable probe file). Anything else is
+    parsed as a plain float — raises ValueError if it isn't one.
+    """
+    if isinstance(spec, str) and spec.strip().lower() == "auto":
+        optimal, info = estimate_optimal_atten_lim(probe_path)
+        if optimal is None:
+            print(f"  [auto] {os.path.basename(probe_path)}: atten-lim estimation failed, "
+                  f"falling back to 12.0dB")
+            return 12.0
+        print(f"  [auto] {os.path.basename(probe_path)}: SNR {info.get('snr')}dB "
+              f"(noise_max={info.get('noise_max')}, overall={info.get('overall')}) "
+              f"-> atten-lim {optimal}dB")
+        return optimal
+    return float(spec)
 
 
 def extract_cover(m4b_path: str, max_size: int = 20 * 1024 * 1024) -> Optional[bytes]:
@@ -423,7 +539,7 @@ def extract_cover(m4b_path: str, max_size: int = 20 * 1024 * 1024) -> Optional[b
         out = os.path.join(tmp, "cover.jpg")
         r = subprocess.run(
             ["ffmpeg", "-y", "-i", m4b_path, "-an", "-vcodec", "copy", out],
-            capture_output=True, text=True, timeout=30,
+            capture_output=True, text=True, errors="replace", timeout=30,
         )
         if r.returncode != 0 or not os.path.exists(out):
             return None
@@ -437,8 +553,8 @@ def extract_cover(m4b_path: str, max_size: int = 20 * 1024 * 1024) -> Optional[b
             with open(out, "rb") as f:
                 head = f.read(8)
                 if not (head.startswith(b"\xff\xd8") or head.startswith(b"\x89PNG")):
-                    # Not JPEG/PNG, still allow but warn
-                    pass
+                    print(f"  [warn] cover is neither JPEG nor PNG, skipping")
+                    return None
                 f.seek(0)
                 return f.read()
         except OSError:
@@ -504,3 +620,46 @@ def create_chapters_ffmetadata(mp3_files: list[str], out_path: str) -> None:
     with open(out_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
         f.write("\n")
+
+
+def probe_chapters(media_path: str) -> list[dict]:
+    """Chapters as [{"start": float, "end": float, "title": str}, ...], in order."""
+    import json
+    r = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_chapters", "-of", "json", media_path],
+        capture_output=True, text=True, errors="replace",
+    )
+    if r.returncode != 0:
+        return []
+    try:
+        raw = json.loads(r.stdout).get("chapters", [])
+    except ValueError:
+        return []
+    out = []
+    for c in raw:
+        try:
+            start, end = float(c.get("start_time", 0)), float(c.get("end_time", 0))
+        except (TypeError, ValueError):
+            continue
+        if end > start:
+            out.append({"start": start, "end": end,
+                        "title": c.get("tags", {}).get("title", "")})
+    return out
+
+
+def probe_format_tags(path: str) -> dict:
+    """Container-level metadata tags, lowercased keys. {} if unreadable.
+
+    Used so `clean` can replay a book's album, album_artist, genre, narrator and
+    description into the output instead of discarding them.
+    """
+    r = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format_tags",
+         "-of", "json", path],
+        capture_output=True, text=True, errors="replace",
+    )
+    try:
+        tags = json.loads(r.stdout).get("format", {}).get("tags") or {}
+    except (ValueError, AttributeError):
+        return {}
+    return {str(k).lower(): v for k, v in tags.items()}

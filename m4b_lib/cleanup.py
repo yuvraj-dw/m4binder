@@ -1,35 +1,31 @@
-"""m4b restoration pipeline.
+"""Audiobook cleanup orchestration.
 
-Two modes:
-  basic — sox noiseprof + noisered + highpass + acompressor + loudnorm
-  ml    — DeepFilterNet 3 inference (chunked for long files)
-
-Common flow:
-  1. Decode m4b -> wav
-  2. Extract chapters + cover from m4b
-  3. Process wav with chosen pipeline
-  4. Re-encode wav -> m4b with chapters + cover preserved
+clean_one and migrate both build a Timeline and hand it to clean_timeline; the
+only difference is where the audio came from.
 """
 import glob
 import os
 import re
 import shutil
-import subprocess
 import tempfile
+import time
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable, Optional
 
-from m4b_lib import ffmpeg_utils
+# `<name>.orig.m4b`, plus the `.orig.1.m4b` form clean_one uses when a backup
+# already exists. Anchored to the extension so a book actually called
+# "Original Sin.m4b" is not mistaken for one.
+_BACKUP_RE = re.compile(r"\.orig(\.\d+)?\.m4b$", re.IGNORECASE)
 
 
-SILENCE_DB_THRESH = -40       # dB below peak considered "silence"
-SILENCE_MIN_DUR = 1.0         # seconds — minimum silence length for noise sampling
-NOISE_AGGRESSION = 0.27       # sox noisered aggression (0.0-1.0; 0.21 old conservative, 0.27-0.30 better for hiss)
-TARGET_I = -19                # LUFS integrated loudness target (ACX -19 typical, -19 mono == -16 stereo)
-TARGET_TP = -2.0              # dB true peak, -3.0 for strict ACX, -2.0 safe for AAC 64k
-TARGET_LRA = 7                # loudness range, 7 LU pro for narration (was 11 too wide)
-HP_FREQ = 70                  # highpass Hz, 70 better than 80 for male warmth (was 80)
-LP_FREQ = 16000               # lowpass Hz, 16k preserves air vs 14k dull (AAC 64k already ~15-16k)
+def is_backup(path: str) -> bool:
+    """True for the `.orig.m4b` files `clean_one --keep-original` writes.
+
+    A directory sweep must skip these: re-cleaning a backup puts a second lossy
+    generation on the one file whose purpose is to be pristine, and the user
+    finds out only when they go looking for the original.
+    """
+    return bool(_BACKUP_RE.search(os.path.basename(path)))
 
 
 def iter_targets(input_arg: str, pattern: str) -> Iterable[str]:
@@ -49,8 +45,8 @@ def iter_targets(input_arg: str, pattern: str) -> Iterable[str]:
         yield str(p)
         return
     elif p.is_dir():
-        # Use Path.rglob with follow_symlinks=False to avoid symlink loops
-        # For pattern without **, use glob; for **, use rglob
+        # pathlib's ** does not follow symlinked directories, so recursion is
+        # bounded without needing an explicit visited-inode set.
         yielded = 0
         try:
             if "**" in pattern:
@@ -59,15 +55,17 @@ def iter_targets(input_arg: str, pattern: str) -> Iterable[str]:
                 suffix = pattern.split("**")[-1].lstrip("/\\")
                 if not suffix:
                     suffix = "*.m4b"
-                # Use rglob with follow_symlinks=False
                 for fp_path in sorted(p.rglob(suffix)):
-                    # Skip symlink dirs already (rglob with follow_symlinks=False does, but double-check)
+                    # pathlib's ** does not follow symlinked directories, so recursion is
+                    # bounded without needing an explicit visited-inode set.
                     try:
                         if fp_path.is_symlink() and fp_path.is_dir():
                             continue
                     except OSError:
                         continue
                     fp = str(fp_path)
+                    if is_backup(fp):
+                        continue          # never re-clean our own backup
                     if fp.lower().endswith(".m4b") and os.path.isfile(fp):
                         yield fp
                         yielded += 1
@@ -81,6 +79,8 @@ def iter_targets(input_arg: str, pattern: str) -> Iterable[str]:
                             continue
                     except OSError:
                         continue
+                    if is_backup(fp):
+                        continue          # never re-clean our own backup
                     if fp.lower().endswith(".m4b") and os.path.isfile(fp):
                         yield fp
                         yielded += 1
@@ -93,633 +93,136 @@ def iter_targets(input_arg: str, pattern: str) -> Iterable[str]:
         raise FileNotFoundError(input_arg)
 
 
-def _decode_to_wav(m4b_path: str, wav_path: str, channels: int = 2, sample_rate: int = 44100) -> None:
-    """Decode any audio container into wav."""
-    subprocess.run(
-        [
-            "ffmpeg", "-y", "-i", m4b_path,
-            "-vn", "-ac", str(channels), "-ar", str(sample_rate), "-c:a", "pcm_s16le",
-            wav_path,
-        ],
-        check=True, capture_output=True, timeout=300,
-    )
+def _workers(overrides: dict | None, stage: str) -> int:
+    from m4b_lib import scheduler
+    if overrides and stage in overrides:
+        return max(1, int(overrides[stage]))
+    return scheduler.default_workers(stage)
 
 
-def _find_silence_window(wav_path: str) -> tuple[float, float] | None:
-    """Return (start_sec, end_sec) of the first silence span >= SILENCE_MIN_DUR, or None."""
-    r = subprocess.run(
-        [
-            "ffmpeg", "-i", wav_path,
-            "-af", f"silencedetect=noise={SILENCE_DB_THRESH}dB:d={SILENCE_MIN_DUR}",
-            "-f", "null", "-",
-        ],
-        capture_output=True, text=True, timeout=120,
-    )
-    if r.returncode != 0:
-        # ffmpeg failed (corrupt wav) - treat as no silence, caller will use fallback
-        print(f"  [warn] silencedetect failed (rc={r.returncode}): {r.stderr[:300]}")
-        return None
-    starts = re.findall(r"silence_start:\s*([\d.]+)", r.stderr)
-    ends = re.findall(r"silence_end:\s*([\d.]+)", r.stderr)
-    if starts and ends:
-        try:
-            return float(starts[0]), float(ends[0])
-        except ValueError:
-            return None
-    return None
+def _validate_output(staged_path: str, expected_duration: float) -> None:
+    """Raise if staged_path is missing/too small, or its duration drifts too far.
 
-
-def _find_silence_windows_adaptive(wav_path: str, thresholds: list[int] = [-40, -35, -30, -25], min_dur: float = 0.5) -> list[tuple[float, float]]:
-    """Intelligent silence finding: try thresholds from strict to loose, collect up to 5 windows."""
-    all_windows = []
-    for db in thresholds:
-        r = subprocess.run(
-            ["ffmpeg", "-i", wav_path, "-af", f"silencedetect=noise={db}dB:d={min_dur}", "-f", "null", "-"],
-            capture_output=True, text=True, timeout=120,
-        )
-        if r.returncode != 0:
-            continue
-        starts = re.findall(r"silence_start:\s*([\d.]+)", r.stderr)
-        ends = re.findall(r"silence_end:\s*([\d.]+)", r.stderr)
-        for s, e in zip(starts, ends):
-            try:
-                s_f, e_f = float(s), float(e)
-                if e_f - s_f >= min_dur:
-                    all_windows.append((s_f, e_f))
-            except:
-                continue
-        if len(all_windows) >= 3:
-            break
-    # Deduplicate and sort by duration desc, take top 5
-    # Remove overlapping windows
-    all_windows = sorted(set(all_windows))
-    # Filter overlapping: keep longest
-    filtered = []
-    for s, e in sorted(all_windows, key=lambda x: x[1]-x[0], reverse=True):
-        if not any(abs(s - fs) < 0.1 and abs(e - fe) < 0.1 for fs, fe in filtered):
-            # Check not overlapping existing too much
-            overlap = any(not (e <= fs or s >= fe) for fs, fe in filtered)
-            if not overlap or len(filtered) < 2:
-                filtered.append((s, e))
-        if len(filtered) >= 5:
-            break
-    return filtered
-
-
-def _sox_pipeline_v2(wav_in: str, wav_out: str, tmpdir: str) -> None:
-    """Improved basic: adaptive silence thresholds, multi-window average noise profile, 0.32 aggression, afftdn fallback."""
-    if shutil.which("sox") is None:
-        raise FileNotFoundError("sox not found in PATH")
-
-    windows = _find_silence_windows_adaptive(wav_in, thresholds=[-40, -35, -30, -25], min_dur=0.5)
-    if not windows:
-        print(f"  [warn] no silence windows found even with adaptive thresholds, using afftdn fallback")
-        _afftdn_pipeline(wav_in, wav_out)
-        return
-
-    print(f"  found {len(windows)} silence windows for noise profile: {windows[:3]}")
-    # Extract up to 3 windows as noise samples and average their profiles
-    noise_samples = []
-    noise_profiles = []
-    try:
-        file_dur = ffmpeg_utils.get_duration(wav_in)
-    except:
-        file_dur = None
-
-    for idx, (start, end) in enumerate(windows[:3]):
-        raw_dur = end - start - 0.1
-        duration = max(0.5, min(2.0, raw_dur))
-        if file_dur is not None and file_dur > 0:
-            remaining = file_dur - (start + 0.05)
-            if remaining <= 0.2:
-                continue
-            duration = min(duration, remaining - 0.05)
-            duration = max(0.3, duration)
-        sample = os.path.join(tmpdir, f"noise_v2_{idx}.wav")
-        prof = os.path.join(tmpdir, f"noise_v2_{idx}.prof")
-        try:
-            subprocess.run(
-                ["sox", wav_in, sample, "trim", f"{start + 0.05}", f"{duration}"],
-                check=True, capture_output=True, text=True, timeout=120,
-            )
-            subprocess.run(
-                ["sox", sample, "-n", "noiseprof", prof],
-                check=True, capture_output=True, text=True, timeout=120,
-            )
-            noise_samples.append(sample)
-            noise_profiles.append(prof)
-        except Exception as e:
-            print(f"  [warn] failed to create noise profile from window {start}-{end}: {e}")
-            continue
-
-    if not noise_profiles:
-        print(f"  [warn] failed to create any noise profiles, afftdn fallback")
-        _afftdn_pipeline(wav_in, wav_out)
-        return
-
-    # Average profiles by mixing noise samples then profiling, or use first profile with higher aggression
-    # Simple: use first profile with 0.32 aggression (bumped from 0.27)
-    try:
-        subprocess.run(
-            [
-                "sox", wav_in, wav_out,
-                "noisered", noise_profiles[0], "0.32",
-                "highpass", str(HP_FREQ),
-                "lowpass", str(LP_FREQ),
-                "compand", "0.05,0.2", "-60,-90,-40,-40,-20,-10,0,-5", "0", "-90", "0.1",
-            ],
-            check=True, capture_output=True, text=True, timeout=120,
-        )
-    except subprocess.CalledProcessError as e:
-        raise RuntimeError(f"sox v2 pipeline failed: {e.stderr or e}") from e
-
-
-def _afftdn_pipeline(wav_in: str, wav_out: str) -> None:
-    """Adaptive noise reduction via ffmpeg afftdn — no silence needed, good for modern clean books."""
-    # afftdn: nr=noise reduction amount (dB?), nf=noise floor, tn=track noise, tr=track residual
-    # Recommended for speech: nr=20-25, nf=-30 to -25, tn=1, tr=1
-    try:
-        subprocess.run(
-            [
-                "ffmpeg", "-y", "-i", wav_in,
-                "-af", f"highpass=f={HP_FREQ},lowpass=f={LP_FREQ},afftdn=nr=20:nf=-30:tn=1:tr=1",
-                "-ac", "1", "-ar", "44100", "-c:a", "pcm_s16le",
-                wav_out,
-            ],
-            check=True, capture_output=True, timeout=120,
-        )
-    except subprocess.CalledProcessError as e:
-        raise RuntimeError(f"afftdn pipeline failed: {e.stderr or e}") from e
-
-
-def _hybrid_pipeline(wav_in: str, wav_out: str, tmpdir: str) -> None:
-    """Hybrid: de-hum notch + highpass + afftdn + sox gate + loudnorm later."""
-    # De-hum 60Hz + harmonics + highpass, then afftdn, then gate
-    try:
-        # First stage: de-hum + highpass + afftdn to intermediate
-        intermediate = os.path.join(tmpdir, "hybrid_step1.wav")
-        subprocess.run(
-            [
-                "ffmpeg", "-y", "-i", wav_in,
-                "-af",
-                f"highpass=f={HP_FREQ},"
-                f"equalizer=f=60:width_type=o:width=2:g=-30,"
-                f"equalizer=f=120:width_type=o:width=2:g=-20,"
-                f"equalizer=f=180:width_type=o:width=2:g=-10,"
-                f"afftdn=nr=15:nf=-30:tn=1:tr=1",
-                "-ac", "1", "-ar", "44100", "-c:a", "pcm_s16le",
-                intermediate,
-            ],
-            check=True, capture_output=True, timeout=120,
-        )
-        # Second stage: sox gate
-        subprocess.run(
-            [
-                "sox", intermediate, wav_out,
-                "compand", "0.05,0.2", "-60,-90,-40,-40,-20,-10,0,-5", "0", "-90", "0.1",
-            ],
-            check=True, capture_output=True, text=True, timeout=120,
-        )
-    except subprocess.CalledProcessError as e:
-        raise RuntimeError(f"hybrid pipeline failed: {e.stderr or e}") from e
-
-
-def _sox_pipeline(wav_in: str, wav_out: str, tmpdir: str) -> None:
-    """Run the basic DSP cleanup chain via sox — pro-tuned: HP 70Hz, LP 16k, gate-downward compand."""
-    if shutil.which("sox") is None:
-        raise FileNotFoundError("sox not found in PATH — required for basic cleanup mode")
-
-    win = _find_silence_window(wav_in)
-    if win is None:
-        print(f"  [warn] no silence window found in {wav_in}; skipping noise reduction")
-        try:
-            subprocess.run(
-                [
-                    "sox", wav_in, wav_out,
-                    "highpass", str(HP_FREQ),
-                    "lowpass", str(LP_FREQ),
-                    "compand", "0.05,0.2", "-60,-90,-40,-40,-20,-10,0,-5", "0", "-90", "0.1",
-                ],
-                check=True, capture_output=True, text=True, timeout=120,
-            )
-        except subprocess.CalledProcessError as e:
-            raise RuntimeError(f"sox fallback pipeline failed: {e.stderr}") from e
-        return
-
-    start, end = win
-    # Guard against silence window at tail where trim would go past EOF
-    try:
-        file_dur = ffmpeg_utils.get_duration(wav_in)
-    except Exception:
-        file_dur = None
-
-    # Clamp duration to 0.5-2.0s and ensure it doesn't go past EOF
-    raw_dur = end - start - 0.1
-    duration = max(0.5, min(2.0, raw_dur))
-    if file_dur is not None and file_dur > 0:
-        remaining = file_dur - (start + 0.05)
-        if remaining <= 0.2:
-            print(f"  [warn] silence window near EOF (start={start:.2f}, file_dur={file_dur:.2f}); skipping noise reduction")
-            subprocess.run(
-                [
-                    "sox", wav_in, wav_out,
-                    "highpass", str(HP_FREQ),
-                    "lowpass", str(LP_FREQ),
-                    "compand", "0.05,0.2", "-60,-90,-40,-40,-20,-10,0,-5", "0", "-90", "0.1",
-                ],
-                check=True, capture_output=True, text=True, timeout=120,
-            )
-            return
-        duration = min(duration, remaining - 0.05)
-        duration = max(0.3, duration)
-
-    noise_sample = os.path.join(tmpdir, "noise.wav")
-    noise_profile = os.path.join(tmpdir, "noise.prof")
-
-    try:
-        subprocess.run(
-            ["sox", wav_in, noise_sample, "trim", f"{start + 0.05}", f"{duration}"],
-            check=True, capture_output=True, text=True, timeout=120,
-        )
-        subprocess.run(
-            ["sox", noise_sample, "-n", "noiseprof", noise_profile],
-            check=True, capture_output=True, text=True, timeout=120,
-        )
-        subprocess.run(
-            [
-                "sox", wav_in, wav_out,
-                "noisered", noise_profile, str(NOISE_AGGRESSION),
-                "highpass", str(HP_FREQ),
-                "lowpass", str(LP_FREQ),
-                "compand", "0.05,0.2", "-60,-90,-40,-40,-20,-10,0,-5", "0", "-90", "0.1",
-            ],
-            check=True, capture_output=True, text=True, timeout=120,
-        )
-    except subprocess.CalledProcessError as e:
-        raise RuntimeError(f"sox pipeline failed: {e.stderr or e}") from e
-
-
-def _loudness_normalize(wav_in: str, wav_out: str, channels: int = 2) -> None:
-    """Two-pass EBU R128 loudness normalize to TARGET_I LUFS with dual_mono for mono.
-
-    Pro standard: I=-19 TP=-2 LRA=7 dual_mono true for mono, linear=true second pass
-    to avoid limiter pumping. Uses soxr high-precision resampler.
+    clean_timeline can raise outright on failure, but it can also succeed while
+    producing a plausible-but-wrong file — truncated, or silently short by a
+    chapter. Nothing downstream catches that, and the caller's os.replace would
+    happily overwrite the user's only copy with it, so this is the last check
+    before that happens.
     """
-    import json
+    from m4b_lib import ffmpeg_utils
 
-    dual_mono = "true" if channels == 1 else "false"
+    if not os.path.exists(staged_path) or os.path.getsize(staged_path) < 1024:
+        size = os.path.getsize(staged_path) if os.path.exists(staged_path) else "missing"
+        raise RuntimeError(f"cleaning produced invalid output: {staged_path} size={size}")
 
-    # Pass 1: measure
-    result = subprocess.run(
-        [
-            "ffmpeg", "-i", wav_in,
-            "-af", f"loudnorm=I={TARGET_I}:TP={TARGET_TP}:LRA={TARGET_LRA}:dual_mono={dual_mono}:print_format=json",
-            "-f", "null", "-",
-        ],
-        capture_output=True, text=True, timeout=600,
-    )
-    # Parse JSON from stderr (ffmpeg prints json to stderr)
-    try:
-        # ffmpeg loudnorm first pass prints a JSON block with input_i, input_tp, input_lra, input_thresh, target_offset
-        # Find the JSON containing input_i
-        json_match = re.search(r'\{[^{}]*"input_i"[^{}]*\}', result.stderr, re.DOTALL)
-        if not json_match:
-            # Fallback: try any JSON blob
-            json_match = re.search(r'\{.*\}', result.stderr, re.DOTALL)
-            if not json_match:
-                raise ValueError("No JSON found in loudnorm output")
-        stats = json.loads(json_match.group(0))
-    except Exception as e:
-        print(f"  [warn] loudnorm first pass JSON parse failed ({e}), falling back to single-pass")
-        # Fallback single-pass
-        subprocess.run(
-            [
-                "ffmpeg", "-y", "-i", wav_in,
-                "-af", f"loudnorm=I={TARGET_I}:TP={TARGET_TP}:LRA={TARGET_LRA}:dual_mono={dual_mono}",
-                "-ar", "44100", "-ac", str(channels), "-c:a", "pcm_s16le",
-                wav_out,
-            ],
-            check=True, capture_output=True, timeout=120,
+    staged_duration = ffmpeg_utils.get_duration(staged_path)
+    if staged_duration is None:
+        raise RuntimeError(f"cleaning produced an unreadable output: {staged_path}")
+
+    tolerance = max(0.5, expected_duration * 0.01)
+    diff = abs(staged_duration - expected_duration)
+    if diff > tolerance:
+        raise RuntimeError(
+            f"cleaning produced a duration mismatch for {staged_path}: "
+            f"expected {expected_duration:.1f}s, got {staged_duration:.1f}s "
+            f"(diff {diff:.1f}s > tolerance {tolerance:.1f}s)"
         )
-        return
-
-    # Extract measured values from first pass (input_* becomes measured_* for second pass)
-    try:
-        measured_i = stats.get("input_i")
-        measured_tp = stats.get("input_tp")
-        measured_lra = stats.get("input_lra")
-        measured_thresh = stats.get("input_thresh")
-        target_offset = stats.get("target_offset", 0)
-        if None in (measured_i, measured_tp, measured_lra, measured_thresh):
-            raise ValueError(f"Incomplete stats: {stats}")
-    except Exception as e:
-        print(f"  [warn] loudnorm stats parse incomplete ({e}), falling back to single-pass")
-        subprocess.run(
-            [
-                "ffmpeg", "-y", "-i", wav_in,
-                "-af", f"loudnorm=I={TARGET_I}:TP={TARGET_TP}:LRA={TARGET_LRA}:dual_mono={dual_mono}",
-                "-ar", "44100", "-ac", str(channels), "-c:a", "pcm_s16le",
-                wav_out,
-            ],
-            check=True, capture_output=True, timeout=120,
-        )
-        return
-
-    # Second pass: apply measured values with linear=true for transparent gain only
-    # Use soxr high-precision resampler
-    af = (
-        f"loudnorm=I={TARGET_I}:TP={TARGET_TP}:LRA={TARGET_LRA}:"
-        f"measured_I={measured_i}:measured_TP={measured_tp}:measured_LRA={measured_lra}:"
-        f"measured_thresh={measured_thresh}:offset={target_offset}:"
-        f"linear=true:dual_mono={dual_mono}:print_format=summary"
-    )
-
-    subprocess.run(
-        [
-            "ffmpeg", "-y", "-i", wav_in,
-            "-af", af,
-            "-ar", "44100", "-ac", str(channels),
-            "-c:a", "pcm_s16le",
-            wav_out,
-        ],
-        check=True, capture_output=True, timeout=120,
-    )
 
 
-def _get_chapters_json(m4b_path: str) -> list[dict]:
-    """Extract chapters via ffprobe json, returns list of {start_time, end_time, title}."""
-    import json
-    r = subprocess.run(
-        ["ffprobe", "-v", "error", "-show_chapters", "-of", "json", m4b_path],
-        capture_output=True, text=True, timeout=30,
-    )
-    if r.returncode != 0:
-        return []
-    try:
-        data = json.loads(r.stdout)
-        chs = data.get("chapters", [])
-        # Normalize
-        result = []
-        for c in chs:
-            try:
-                start = float(c.get("start_time", 0))
-                end = float(c.get("end_time", 0))
-                title = c.get("tags", {}).get("title", "")
-                if end > start:
-                    result.append({"start": start, "end": end, "title": title})
-            except:
-                continue
-        return result
-    except:
-        return []
+def clean_timeline(tl, out_path: str, *, atten_lim_db: float = 12.0,
+                   pf: bool = False, backend: str = "df3", device: str = "cpu",
+                   workers: dict | None = None, bitrate: str = "64k",
+                   on_stage: Optional[Callable[[str, float], None]] = None) -> None:
+    """Run enhance -> loudness -> encode+mux and write out_path.
 
-
-def clean_one(m4b_path: str, mode: str = "auto", keep_original: bool = False,
-              skip_threshold_db: float = -35.0, chunk_s: float = 60.0, overlap_s: float = 2.0,
-              device: str = None, atten_lim_db: str = "12", pf: bool = False, pf_beta: float = 0.02,
-              jobs: int = 1, parallel_chapters: bool = True) -> None:
-    """Run the cleanup pipeline on one m4b in place, preserving chapters + cover.
-
-    Single best pipeline: ml-rust 12dB, HP70, two-pass -19 LUFS TP -2 LRA7 mono 64k.
-    Mode param kept for backward compat but ignored — always does best.
-    If file has multiple chapters and jobs>1 and parallel_chapters True, processes chapters in parallel
-    (natural boundaries, no crossfade needed, ~8x speedup for 30h book with 49 chapters on 8 cores).
+    `on_stage(name, seconds)`, if given, is called after each of the three
+    stages with its wall-clock duration. This exists so a measurement tool
+    can report real per-stage timing without re-implementing this
+    orchestration itself — a duplicate of this sequence in a second place
+    is exactly what drifts (m4binder-research's measure_pipeline.py used to
+    run loudness serially while this function always ran it in a
+    ThreadPoolExecutor, silently measuring a slower pipeline than the one
+    that ships).
     """
-    print(f"\n=== Cleaning: {m4b_path} (mode={mode}) ===")
+    # Imported here, not at module scope: these pull in soundfile/numpy, and
+    # iter_targets above must stay importable without the ml extra installed.
+    from m4b_lib import encode, loudness, scheduler
+    from m4b_lib.enhance import EnhanceConfig
+    from m4b_lib.enhance import df3 as _df3  # noqa: F401  (registers "df3")
+    from m4b_lib.streams import plan_streams
 
-    noise = ffmpeg_utils.probe_noise_floor(m4b_path)
-    if noise is None:
-        print(f"  [warn] could not probe mean volume, proceeding with cleaning")
-    elif noise < skip_threshold_db:
-        print(f"  mean volume {noise:.1f}dB below threshold {skip_threshold_db}dB; skipping")
-        return
-    else:
-        print(f"  mean volume {noise:.1f}dB (threshold {skip_threshold_db}dB) -> cleaning")
+    workdir = os.path.dirname(os.path.abspath(tl.wav_path))
+    cfg = EnhanceConfig(atten_lim_db=atten_lim_db, pf=pf)
 
-    # Use same filesystem as output for atomic replace safety
-    output_parent = os.path.dirname(os.path.abspath(m4b_path))
-    with tempfile.TemporaryDirectory(prefix="m4b_clean_", dir=output_parent) as tmp:
-        wav_decoded = os.path.join(tmp, "decoded.wav")
-        wav_cleaned = os.path.join(tmp, "cleaned.wav")
-        wav_normalized = os.path.join(tmp, "normalized.wav")
-        chapters_ini = os.path.join(tmp, "chapters.ini")
-        cleaned_m4b = os.path.join(tmp, "cleaned.m4b")
+    t0 = time.time()
+    enhanced = scheduler.enhance_timeline(
+        tl, os.path.join(workdir, "enhanced.wav"), backend=backend, cfg=cfg,
+        device=device, workers=_workers(workers, "df3"),
+    )
+    if on_stage:
+        on_stage("enhance", time.time() - t0)
 
-        # Choose decode params based on mode to avoid unnecessary resampling
-        # Both modes now decode mono for final mono 64k standard (pro audiobook mono)
-        # Basic: 1ch 44.1k keeps native SR, ML/ML-Rust: 1ch 48k matches DF3 native
-        if mode in ("ml", "ml-rust"):
-            _decode_to_wav(m4b_path, wav_decoded, channels=1, sample_rate=48000)
-        else:
-            _decode_to_wav(m4b_path, wav_decoded, channels=1, sample_rate=44100)
+    t0 = time.time()
+    specs = plan_streams(tl.frames, _workers(workers, "loudness"))
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=len(specs)) as ex:
+        measured = list(ex.map(
+            lambda s: loudness.analyze(enhanced, s.start_frame, s.end_frame, tl.sample_rate),
+            specs,
+        ))
+    gain = loudness.gain_db(loudness.combine(measured))
+    if on_stage:
+        on_stage("loudness", time.time() - t0)
 
-        # Extract chapters and cover from source (chapters_ini for final embed)
-        try:
-            ffmpeg_utils.extract_chapters(m4b_path, chapters_ini)
-        except subprocess.CalledProcessError as e:
-            print(f"  [warn] chapter extraction failed: {e.stderr[:200] if e.stderr else e}")
-            chapters_ini = None
+    t0 = time.time()
+    enc_specs = plan_streams(tl.frames, _workers(workers, "encode"))
+    parts = encode.encode_streams(
+        enhanced, enc_specs, gain_db=gain, sample_rate=tl.sample_rate,
+        workdir=os.path.join(workdir, "parts_enc"), bitrate=bitrate,
+        workers=_workers(workers, "encode"),
+    )
+    encode.concat_and_mux(parts, tl.chapters, out_path,
+                          cover_bytes=tl.cover_bytes, title=tl.title,
+                          author=tl.author, source_tags=tl.source_tags)
+    if on_stage:
+        on_stage("encode+mux", time.time() - t0)
 
-        cover_bytes = ffmpeg_utils.extract_cover(m4b_path)
-        if cover_bytes:
-            print(f"  cover preserved ({len(cover_bytes)} bytes)")
-        else:
-            print(f"  no cover found (will be stripped)")
 
-        # Determine backend: ml-rust (Rust CPU, low RAM), ml-torch (Torch GPU, 2x faster), ml/auto (auto-select GPU if available else Rust)
-        # Single best single set is ml-rust 12dB, but torch GPU is too good to pass up per user request
-        mode = (mode or "auto").lower()
-        if mode in ("auto", "best"):
-            # Auto-select best available: prefer GPU torch if CUDA available for speed, else Rust for low RAM
-            try:
-                import torch
-                if torch.cuda.is_available() and (device is None or device != "cpu"):
-                    mode = "ml-torch"
-                else:
-                    mode = "ml-rust"
-            except:
-                mode = "ml-rust"
+def clean_one(m4b_path: str, *, keep_original: bool = True,
+              atten_lim_db: float = 12.0, pf: bool = False, backend: str = "df3",
+              device: str = "cpu", workers: dict | None = None,
+              bitrate: str = "64k") -> None:
+    """Clean `m4b_path` in place, keeping `<name>.orig.m4b` unless told not to.
 
-        # Handle atten-lim auto for both backends
-        if isinstance(atten_lim_db, str) and str(atten_lim_db).lower() == "auto":
-            print(f"  estimating optimal atten-lim (auto) from SNR...")
-            optimal, info = ffmpeg_utils.estimate_optimal_atten_lim(m4b_path)
-            if optimal is not None:
-                print(f"  auto atten-lim: SNR {info.get('snr'):.1f}dB (noise max {info.get('noise_max'):.1f} vs overall {info.get('overall'):.1f}) -> {optimal}dB")
-                atten_lim_db = optimal
-            else:
-                atten_lim_db = 12.0
-        else:
-            try:
-                atten_lim_db = float(atten_lim_db)
-            except:
-                atten_lim_db = 12.0
+    **`keep_original` defaults to True as of 2026-08-10, reversing the previous
+    default.** This function overwrites the user's file with model output, and
+    there is a known class of book where that output is worse: DeepFilterNet3
+    treats a music bed as noise. In the round-9 blind test the untouched file
+    took first place on the one book in the set with music, ahead of every
+    processed variant, and the damage is silent — the book still plays.
 
-        # Resolve backend
-        if mode in ("ml-rust", "rust", "ml_rust"):
-            from m4b_lib.cleanup_ml_rust import _find_binary, rust_enhance, ensure_rust_binary
-            try:
-                binary = _find_binary()
-                if binary is None:
-                    print(f"  Rust binary not found, auto-installing deep-filter to ~/.local/bin/...")
-                    binary = ensure_rust_binary()
-            except Exception as e:
-                print(f"  Auto-install failed ({e}), trying direct detection...")
-                binary = _find_binary()
-            if binary is None:
-                raise FileNotFoundError("deep-filter Rust binary not found — install via cargo install deep_filter")
-            backend = "rust"
-            print(f"  using Rust deep-filter backend ({binary}) [best: atten_lim={atten_lim_db}dB pf={pf} chunk={chunk_s}s]")
-        elif mode in ("ml-torch", "torch", "ml_torch", "ml"):
-            # Torch path with GPU acceleration
-            try:
-                from m4b_lib.cleanup_ml import df3_enhance, _ensure_model
-                import torch
-                cuda_available = torch.cuda.is_available()
-                if device:
-                    _ensure_model(device_override=device)
-                    print(f"  using Torch DeepFilterNet3 backend (device override {device}, cuda_available={cuda_available})")
-                else:
-                    _ensure_model()
-                    dev = "cuda" if cuda_available else "cpu"
-                    print(f"  using Torch DeepFilterNet3 backend (auto device {dev}, cuda_available={cuda_available}) [best: chunk={chunk_s}s]")
-                backend = "torch"
-                if atten_lim_db != 100.0:
-                    print(f"  [warn] torch backend ignores atten-lim {atten_lim_db}dB, does full NR (100dB). Use ml-rust for tunable atten-lim.")
-            except ImportError as e:
-                print(f"  Torch backend not available ({e}), falling back to Rust")
-                from m4b_lib.cleanup_ml_rust import _find_binary, rust_enhance, ensure_rust_binary
-                binary = _find_binary() or ensure_rust_binary()
-                backend = "rust"
-                print(f"  using Rust deep-filter backend ({binary}) [fallback]")
-        else:
-            # Fallback for old basic modes: map to ml-rust best (basic worthless per user)
-            print(f"  [warn] mode {mode} deprecated, using best ml-rust 12dB")
-            from m4b_lib.cleanup_ml_rust import _find_binary, rust_enhance, ensure_rust_binary
-            binary = _find_binary() or ensure_rust_binary()
-            backend = "rust"
+    A backup is cheap and reversible; an over-suppressed music bed is neither.
+    Callers that genuinely want the old behaviour pass `keep_original=False`,
+    which is now an explicit choice rather than the path of least resistance.
+    """
+    from m4b_lib import ffmpeg_utils, timeline
 
-        # Chapter-parallel cleaning if file has many chapters and jobs>1
-        chapters = _get_chapters_json(m4b_path)
-        use_chapter_parallel = parallel_chapters and jobs > 1 and len(chapters) > 1
-        if use_chapter_parallel:
-            print(f"  chapter-parallel cleaning: {len(chapters)} chapters with {jobs} jobs (natural boundaries, no crossfade pumping)")
-            # Extract each chapter to wav in parallel (decode only that segment)
-            chapter_wavs = []
-            for i, ch in enumerate(chapters):
-                wav_path = os.path.join(tmp, f"chapter_{i:03d}.wav")
-                chapter_wavs.append((ch, wav_path))
+    source_duration = ffmpeg_utils.get_duration(m4b_path)
 
-            def _extract_chapter(args):
-                ch, wav_path = args
-                # Extract segment from original m4b
-                cmd = [
-                    "ffmpeg", "-y", "-ss", str(ch["start"]), "-to", str(ch["end"]),
-                    "-i", m4b_path, "-vn", "-ac", "1", "-ar", "48000", "-c:a", "pcm_s16le",
-                    wav_path
-                ]
-                subprocess.run(cmd, check=True, capture_output=True, timeout=300)
-                return wav_path
+    parent = os.path.dirname(os.path.abspath(m4b_path))
+    with tempfile.TemporaryDirectory(prefix="m4b_clean_", dir=parent) as tmp:
+        tl = timeline.from_m4b(m4b_path, tmp)
+        staged = os.path.join(tmp, "cleaned.m4b")
+        clean_timeline(tl, staged, atten_lim_db=atten_lim_db, pf=pf, backend=backend,
+                       device=device, workers=workers, bitrate=bitrate)
+        _validate_output(staged, source_duration if source_duration is not None else tl.duration)
 
-            from concurrent.futures import ThreadPoolExecutor
-            with ThreadPoolExecutor(max_workers=jobs) as ex:
-                # Extract in parallel
-                list(ex.map(_extract_chapter, chapter_wavs))
-
-            # Now clean each chapter wav in parallel (shared Rust binary, CPU)
-            cleaned_chapter_wavs = []
-            for _, wav_path in chapter_wavs:
-                cleaned = wav_path.replace(".wav", "_cleaned.wav")
-                cleaned_chapter_wavs.append((wav_path, cleaned))
-
-            def _clean_chapter(args):
-                wav_in, wav_out = args
-                if backend == "rust":
-                    rust_enhance(wav_in, wav_out, atten_lim_db=atten_lim_db, pf=pf, pf_beta=pf_beta)
-                else:
-                    # Torch backend with GPU acceleration
-                    from m4b_lib.cleanup_ml import df3_enhance
-                    df3_enhance(wav_in, wav_out, chunk_s=chunk_s, overlap_s=overlap_s)
-                return wav_out
-
-            with ThreadPoolExecutor(max_workers=jobs) as ex:
-                results = list(ex.map(_clean_chapter, cleaned_chapter_wavs))
-
-            # Concat cleaned chapter wavs in order to wav_cleaned
-            cleaned_only = [c for _, c in cleaned_chapter_wavs]
-            listfile = os.path.join(tmp, "chapters_concat.txt")
-            with open(listfile, "w", encoding="utf-8") as f:
-                for p in cleaned_only:
-                    safe = p.replace("\\", "\\\\").replace("'", r"'\''")
-                    f.write(f"file '{safe}'\n")
-
-            subprocess.run(
-                ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", listfile, "-c", "copy", wav_cleaned],
-                check=True, capture_output=True, timeout=300,
-            )
-            print(f"  cleaned {len(chapters)} chapters in parallel ({backend}) -> {wav_cleaned}")
-
-        else:
-            # Fallback: decode whole file to wav then clean
-            _decode_to_wav(m4b_path, wav_decoded, channels=1, sample_rate=48000)
-            if backend == "rust":
-                print(f"  using Rust deep-filter backend ({binary}) [best: atten_lim={atten_lim_db}dB pf={pf} chunk={chunk_s}s]")
-                rust_enhance(wav_decoded, wav_cleaned, atten_lim_db=atten_lim_db, pf=pf, pf_beta=pf_beta)
-            else:
-                print(f"  using Torch DeepFilterNet3 backend [GPU accelerated if available, chunk={chunk_s}s]")
-                from m4b_lib.cleanup_ml import df3_enhance
-                df3_enhance(wav_decoded, wav_cleaned, chunk_s=chunk_s, overlap_s=overlap_s)
-
-        # Loudness normalize — unified mono 64k standard for audiobooks (pro: 64k mono = higher quality per channel than 64k stereo)
-        _loudness_normalize(wav_cleaned, wav_normalized, channels=1)
-
-        ffmpeg_utils.embed_chapters_and_meta(
-            wav_normalized, chapters_ini=chapters_ini, cover_bytes=cover_bytes,
-            output_m4b=cleaned_m4b, tmpdir=tmp,
-        )
-
-        # Validate output before overwriting original
-        if not os.path.exists(cleaned_m4b) or os.path.getsize(cleaned_m4b) < 1024:
-            raise RuntimeError(f"cleaning produced invalid output: {cleaned_m4b} size={os.path.getsize(cleaned_m4b) if os.path.exists(cleaned_m4b) else 'missing'}")
-
-        # Duration validation: cleaned should be within 1% or 0.5s of decoded
-        try:
-            orig_dur = ffmpeg_utils.get_duration(m4b_path)
-            cleaned_dur = ffmpeg_utils.get_duration(cleaned_m4b)
-            if orig_dur is not None and cleaned_dur is not None:
-                diff = abs(cleaned_dur - orig_dur)
-                if diff > max(0.5, orig_dur * 0.01):
-                    print(f"  [warn] duration drift: original {orig_dur:.1f}s vs cleaned {cleaned_dur:.1f}s diff {diff:.1f}s")
-        except Exception as e:
-            print(f"  [warn] duration validation failed: {e}")
-
-        # Handle keep_original safely: copy original to backup BEFORE replacing, so if replace fails
-        # original still exists and we don't end up with missing file
         if keep_original:
             backup = os.path.splitext(m4b_path)[0] + ".orig.m4b"
-            # Avoid clobbering existing backup — version it
-            if os.path.exists(backup):
-                base, ext = os.path.splitext(backup)
-                i = 1
-                while os.path.exists(f"{base}.{i}{ext}"):
-                    i += 1
+            base, ext = os.path.splitext(backup)
+            i = 1
+            while os.path.exists(backup):
                 backup = f"{base}.{i}{ext}"
-            # Copy, not move, to preserve original until replace succeeds
+                i += 1
             shutil.copy2(m4b_path, backup)
-            print(f"  original kept at: {backup}")
-
-        # Atomic replace if same FS (tmp is in same dir as output, so replace is atomic)
-        try:
-            os.replace(cleaned_m4b, m4b_path)
-        except OSError as e:
-            # Fallback across FS (shouldn't happen since tmp is in output_parent)
-            # If keep_original was True, original already backed up, but we copied not moved,
-            # so original still exists. Try move, and if that also fails, backup remains.
-            try:
-                shutil.move(cleaned_m4b, m4b_path)
-            except Exception as move_e:
-                # If we had backed up via copy, we still have original intact
-                # Clean up and raise with context
-                raise RuntimeError(f"Failed to replace {m4b_path}: replace failed {e}, move failed {move_e}") from move_e
-
-        print(f"  done: {m4b_path}")
+        os.replace(staged, m4b_path)

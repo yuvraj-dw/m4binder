@@ -1,0 +1,31 @@
+name: ci
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      - name: Install package with CPU torch
+        run: |
+          python -m pip install --upgrade pip
+          # The CPU wheel must install BEFORE `.[ml]`, as two separate steps.
+          # `.[ml]`'s unqualified torch==2.6.0 and this +cpu build are the same
+          # PEP 440 local version, so pip treats the requirement as already
+          # satisfied and leaves the +cpu wheel alone — installing both in one
+          # combined step (or reordering them) risks pip instead resolving the
+          # unqualified spec against PyPI and pulling the much larger CUDA
+          # wheel, silently losing the CPU pin.
+          pip install torch==2.6.0+cpu torchaudio==2.6.0+cpu \
+            --extra-index-url https://download.pytorch.org/whl/cpu
+          pip install -e ".[ml,dev]"
+      - name: Verify ML extra actually installed
+        run: |
+          python -c "import torch, soundfile, df; print('torch', torch.__version__)"
+          python -m pytest tests/ -m ml --co -q
+      - name: Test
+        run: pytest tests/ -v
